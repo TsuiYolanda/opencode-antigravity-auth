@@ -10,13 +10,26 @@ export interface LoopbackHandle {
   close(): Promise<void>;
 }
 
+function isGenerativeLanguageUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.protocol === "https:" && parsed.hostname === "generativelanguage.googleapis.com"
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Redirect a generative-language request to the loopback origin, carrying the
  * original URL in a header so the handler can rebuild the call. Non-generative
- * requests are returned untouched (idempotent under repeated hooks).
+ * requests are returned untouched (idempotent under repeated hooks). Hostname
+ * must match exactly — a substring match would let crafted URLs through and
+ * leak the bearer token to third-party hosts.
  */
 export function rewriteRequestToLoopback(request: Request, port: number): Request {
-  if (!request.url.includes("generativelanguage.googleapis.com")) return request;
+  if (!isGenerativeLanguageUrl(request.url)) return request;
   const target = new URL(request.url);
   target.protocol = "http:";
   target.host = `127.0.0.1:${port}`;
@@ -42,12 +55,13 @@ const HOP_BY_HOP_OR_META = new Set([
 export function createLoopbackServer(pipeline: PipelineFetch | null): LoopbackHandle {
   const server: Server = createServer((req, res) => {
     void (async () => {
-      let settled = false;
+      // Sink dest-side socket errors so they never become unhandled.
+      res.on("error", () => {});
+      // Client disconnect at ANY stage (before or mid response) aborts the
+      // upstream pipeline: frees the Google connection and quota.
       const abort = new AbortController();
-      // res 'close' with writableEnded false is the portable client-disconnect
-      // signal (Bun emits req 'close' once the request body is consumed).
       res.on("close", () => {
-        if (!settled && !res.writableEnded) abort.abort(new Error("client disconnected"));
+        if (!res.writableEnded) abort.abort(new Error("client disconnected"));
       });
       try {
         const originalUrl = req.headers[ORIGINAL_URL_HEADER];
@@ -71,8 +85,19 @@ export function createLoopbackServer(pipeline: PipelineFetch | null): LoopbackHa
               error: {
                 message:
                   "opencode-antigravity-auth (V2): no accounts configured. " +
-                  "Re-login needs the V1 flow until the V2 login port lands (see docs/superpowers/specs).",
+                  "Re-login needs the V1 flow until the V2 login port lands (see docs/superpowers/specs). " +
+                  "Restart opencode after adding accounts.",
               },
+            }),
+          );
+          return;
+        }
+
+        if (!isGenerativeLanguageUrl(originalUrl)) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: { message: "loopback rejected non-generative original URL" },
             }),
           );
           return;
@@ -99,14 +124,18 @@ export function createLoopbackServer(pipeline: PipelineFetch | null): LoopbackHa
           outHeaders[k] = v;
         });
         res.writeHead(response.status, outHeaders);
-        settled = true;
         if (!response.body) {
           res.end();
           return;
         }
-        Readable.fromWeb(response.body as never).pipe(res);
+        const source = Readable.fromWeb(response.body as never);
+        // A failing upstream body must tear down this response, never the
+        // host process: without this listener the 'error' event is unhandled.
+        source.on("error", (err) => {
+          if (!res.writableEnded) res.destroy(err instanceof Error ? err : new Error(String(err)));
+        });
+        source.pipe(res);
       } catch (error) {
-        settled = true;
         if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: `loopback failure: ${String(error)}` } }));
       }

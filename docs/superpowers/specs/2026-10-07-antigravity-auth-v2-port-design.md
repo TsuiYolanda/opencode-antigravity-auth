@@ -137,6 +137,17 @@ TUI toast（改日志 stub）、会话恢复 hook（tool_result_missing 自动�
 已知限制：
 1. refresh token 彻底失效时无法重新登录（后续版本或临时回 V1 登录一次）。
 2. Claude 模型下打断工具调用后可能报 tool_result_missing，重发一条消息恢复。
+3. **拦截范围**：hook 会拦截本机发往 generativelanguage.googleapis.com 的全部
+   provider 请求（含 title 生成等辅助请求），一律改走 Antigravity 管线。若日后
+   同时在 google provider 上使用真实付费 API key 的普通 Gemini 模型，会被静默
+   劫持到 Antigravity 配额——本 fork 假定 google provider 专用于 antigravity 模型。
+4. **运行环境**：本机直连 Google 不通，opencode 进程需带 `HTTPS_PROXY`
+   （如 `http://127.0.0.1:7890`）启动，否则 token 刷新与模型请求会陷入静默重试。
+5. **进程级资源**：loopback server 为模块级单例，随 opencode server 进程存活，
+   cleanup 只清理定时器并 dispose 各实例的 hook registration（多 location 实例
+   共享 server，关闭会破坏兄弟实例）。
+6. **调试开关**：环境变量 `AGA_DUMP_BODY=1` 会把命中拦截的原始请求体追加写入
+   `$TMPDIR/aga-loopback-dump.json`（含对话内容，仅调试用）。
 
 ## 验证方案
 

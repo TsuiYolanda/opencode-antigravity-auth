@@ -119,15 +119,18 @@ export default Plugin.define({
 
         state.handle = createLoopbackServer(state.pipeline);
         state.port = await state.handle.listen();
-        await ctx.session.hook("http.request", buildRequestHook(state.port));
+        const registration = await ctx.session.hook("http.request", buildRequestHook(state.port));
         return () => {
           clearInterval(timer);
+          void registration.dispose?.();
         };
       }
       state.handle = createLoopbackServer(null);
       state.port = await state.handle.listen();
     }
-    await ctx.session.hook("http.request", buildRequestHook(state.port));
-    return () => {};
+    const registration = await ctx.session.hook("http.request", buildRequestHook(state.port));
+    return () => {
+      void registration.dispose?.();
+    };
   },
 });

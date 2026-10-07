@@ -143,3 +143,76 @@ describe("createLoopbackServer abort semantics", () => {
     expect(signal?.aborted).toBe(true);
   });
 });
+
+describe("createLoopbackServer stream-safety and URL validation", () => {
+  it("does not crash the process when the pipeline body stream errors mid-flight", async () => {
+    const pipeline = async (): Promise<Response> =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("data: first\n\n"));
+            setTimeout(() => controller.error(new Error("upstream reset mid-stream")), 30);
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    const handle = createLoopbackServer(pipeline);
+    handles.push(handle);
+    const port = await handle.listen();
+    const res = await fetch(`http://127.0.0.1:${port}/x`, {
+      headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL },
+    });
+    await expect(res.text()).rejects.toThrow();
+    // survival check: server still answers a follow-up request
+    const ok = await fetch(`http://127.0.0.1:${port}/y`, { headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL } });
+    expect(ok.status).toBe(200);
+  });
+
+  it("aborts the pipeline when the client disconnects after the first chunk", async () => {
+    let signal: AbortSignal | undefined;
+    const pipeline = async (_input: RequestInfo, init?: RequestInit): Promise<Response> => {
+      signal = init?.signal ?? undefined;
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("data: first\n\n"));
+            // never close: simulate long generation
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    };
+    const handle = createLoopbackServer(pipeline);
+    handles.push(handle);
+    const port = await handle.listen();
+    const controller = new AbortController();
+    const res = await fetch(`http://127.0.0.1:${port}/x`, {
+      headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL },
+      signal: controller.signal,
+    });
+    const reader = res.body!.getReader();
+    await reader.read(); // first chunk received, streaming started
+    controller.abort();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("rejects original URLs whose hostname is not generativelanguage.googleapis.com", async () => {
+    const pipeline = vi.fn(async () => new Response("never"));
+    const handle = createLoopbackServer(pipeline as never);
+    handles.push(handle);
+    const port = await handle.listen();
+    const res = await fetch(`http://127.0.0.1:${port}/x`, {
+      headers: { [ORIGINAL_URL_HEADER]: "https://evil.com/a?generativelanguage.googleapis.com" },
+    });
+    expect(res.status).toBe(400);
+    expect(pipeline).not.toHaveBeenCalled();
+  });
+});
+
+describe("rewriteRequestToLoopback hostname precision", () => {
+  it("does not rewrite a URL that only mentions the domain in its query string", () => {
+    const req = new Request("https://evil.com/a?u=generativelanguage.googleapis.com");
+    expect(rewriteRequestToLoopback(req, 37899)).toBe(req);
+  });
+});
