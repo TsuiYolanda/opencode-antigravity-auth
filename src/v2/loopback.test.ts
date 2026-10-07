@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { createLoopbackServer, rewriteRequestToLoopback, ORIGINAL_URL_HEADER } from "./loopback";
 
 const handles: Array<{ close(): Promise<void> }> = [];
