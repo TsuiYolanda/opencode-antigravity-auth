@@ -13,7 +13,8 @@
 ## Global Constraints
 
 - 目标运行时：opencode v2.0.16；V2 SDK 固定 `@opencode/plugin@^2.0.24`（2026-10-07 时 latest）。
-- 抽取必须是"只搬位置"：管线循环体逐行保留，唯一允许的新增是工厂签名、deps 解构和 `const fetch = deps.rawFetch` 遮蔽（防止补丁后自递归）。
+- 抽取必须是"只搬位置"：管线循环体逐行保留，唯一允许的新增是工厂签名与 deps 解构。
+- 拦截方式（2026-10-08 修订，B'）：`ctx.session.hook("http.request")` 改道到插件 loopback HTTP server；**禁止**补丁 `globalThis.fetch`（探针已证对 provider 流量无效）。
 - 所有 commit 只进本地 `v2-port` 分支；**任何 push 必须先获得用户明确确认**（Task 8 有专门 gate）。
 - 保留 `@opencode-ai/plugin` 依赖，不删除（`src/plugin.ts` 顶部 import 它）。
 - Task 8 之前不改用户的 `~/.config/opencode/opencode.json`。
@@ -22,15 +23,17 @@
 
 ## Review Focus
 
-1. **非 Google 请求被补丁破坏**（server 里 npm/registry/MCP 等所有 fetch）→ Task 2 步骤 1 的 passthrough 测试 + Task 4 步骤 1 的 wrapper passthrough 测试。
-2. **插件被多 location 重复加载导致 wrapper 层层嵌套**（日志证实 server 会多次 load plugin）→ Task 4 步骤 4 的幂等测试（连续 install 两次，pipeline 只被调用一次）。
+1. **非 Google 请求被拦截破坏**（hook 误伤其他 provider 流量）→ Task 2 步骤 1 的 passthrough 测试 + Task 4 步骤 1 的 hook 非命中放行测试。
+2. **插件被多 location 重复加载导致 hook 重复改道/嵌套**（日志证实 server 会多次 load plugin）→ Task 4 步骤 4 的幂等测试（改道后的 loopback URL 不再命中 isGenerativeLanguageRequest，二次 hook 自然跳过）。
 3. **账号文件缺失/为空时插件崩溃或请求泄漏到真 Google API** → Task 4 步骤 5 的 503 synthetic 响应测试 + Task 3 步骤 1 的空 snapshot 测试。
-4. **SSE 流式响应被 wrapper 破坏**（5 个模型全部走 `:streamGenerateContent`）→ Task 7 对 5 个模型逐一真实请求验证。
-5. **补丁后管线内部 fetch 自递归**（outbound 调用重入 wrapper）→ Task 2 的 `rawFetch` 遮蔽设计 + Task 2 步骤 1 测试断言 rawFetch 直达。
+4. **SSE 流式响应被 loopback 桥接破坏**（5 个模型全部走 `:streamGenerateContent`）→ Task 4 步骤 6 的流式透传单测 + Task 7 对 5 个模型逐一真实请求验证。
+5. **原始 URL 信息在改道时丢失**（管线按 URL 解析 model/family/quota）→ Task 4 步骤 3 的 `x-antigravity-original-url` 还原测试。
 
 ---
 
 ### Task 1: 探针——验证 V2 server 的 provider 请求走 globalThis.fetch
+
+> **结果（2026-10-08 已执行）**：gate 对方案 A 否决——provider 请求不走 `globalThis.fetch`（Bun 打包的 provider 运行时持有独立 fetch 引用），但实证 `http.request` hook 可完整改写 provider 请求与响应路径。用户已批准切换 B'（loopback server 形态）。本任务无需重跑。
 
 **Files:**
 - Create（仓库外，throwaway）: `$TMPDIR/opencode/aga-probe/package.json`、`$TMPDIR/opencode/aga-probe/index.mjs`、`$TMPDIR/opencode/aga-e2e-probe/opencode.json`
@@ -104,7 +107,7 @@ rm -rf "$TMPDIR/opencode/aga-probe" "$TMPDIR/opencode/aga-e2e-probe" "$TMPDIR/ag
 - Consumes: `GetAuth`、`AccountManager`（`src/plugin/accounts.ts:316` `static loadFromDisk(authFallback?)`）、`AntigravityConfig`（`loadConfig(directory)`）
 - Produces:
   - `createAntigravityFetch(deps: AntigravityFetchDeps): (input: RequestInfo, init?: RequestInit) => Promise<Response>`
-  - `AntigravityFetchDeps { getAuth: GetAuth; accountManager: AccountManager; client: PipelineClient; config: AntigravityConfig; providerId: string; rawFetch: typeof fetch }`
+  - `AntigravityFetchDeps { getAuth: GetAuth; accountManager: AccountManager; client: PipelineClient; config: AntigravityConfig; providerId: string }`
   - `PipelineClient { tui: { showToast(i: { body: { message: string; variant: string } }): Promise<unknown> }; auth: { set(i: { path: { id: string }; body: { type: "oauth"; refresh: string; access: string; expires: number } }): Promise<unknown> } }`
   - `buildAuthSuccessFromStoredAccount(account: { refreshToken: string; projectId?: string; managedProjectId?: string; email?: string })`（从 plugin.ts 导出，Task 3/4 用）
 
@@ -139,25 +142,35 @@ function makeDeps(overrides: Partial<AntigravityFetchDeps> = {}): AntigravityFet
     client: { tui: { showToast: vi.fn() }, auth: { set: vi.fn() } } as unknown as AntigravityFetchDeps["client"],
     config: loadConfig(mkdtempSync(join(tmpdir(), "aga-proj-"))),
     providerId: "google",
-    rawFetch: vi.fn(async () => new Response("passthrough")) as unknown as typeof fetch,
     ...overrides,
   };
 }
 
 describe("createAntigravityFetch", () => {
-  it("passes non-generative requests straight to rawFetch without reading auth", async () => {
-    const deps = makeDeps();
-    const f = createAntigravityFetch(deps);
-    await f("https://example.com/v1/x", { method: "GET" });
-    expect(deps.rawFetch).toHaveBeenCalledWith("https://example.com/v1/x", { method: "GET" });
-    expect(deps.getRawAuthNever as unknown as undefined).toBeUndefined();
-    expect(deps.getAuth).not.toHaveBeenCalled();
+  it("passes non-generative requests straight to global fetch without reading auth", async () => {
+    const passthrough = vi.fn(async () => new Response("passthrough"));
+    vi.stubGlobal("fetch", passthrough);
+    try {
+      const deps = makeDeps();
+      const f = createAntigravityFetch(deps);
+      await f("https://example.com/v1/x", { method: "GET" });
+      expect(passthrough).toHaveBeenCalledWith("https://example.com/v1/x", { method: "GET" });
+      expect(deps.getAuth).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("passes through when auth is not OAuth", async () => {
-    const deps = makeDeps({ getAuth: vi.fn(async () => ({ type: "api", key: "k" })) });
-    await createAntigravityFetch(deps)(GENERATIVE_URL);
-    expect(deps.rawFetch).toHaveBeenCalled();
+    const passthrough = vi.fn(async () => new Response("passthrough"));
+    vi.stubGlobal("fetch", passthrough);
+    try {
+      const deps = makeDeps({ getAuth: vi.fn(async () => ({ type: "api", key: "k" })) });
+      await createAntigravityFetch(deps)(GENERATIVE_URL);
+      expect(passthrough).toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("throws the actionable error when no accounts exist", async () => {
@@ -198,8 +211,6 @@ export interface AntigravityFetchDeps {
   client: PipelineClient;
   config: AntigravityConfig;
   providerId: string;
-  /** Pristine fetch captured before any globalThis patch; all pipeline I/O must go through it. */
-  rawFetch: typeof fetch;
 }
 ```
 
@@ -214,10 +225,6 @@ export function createAntigravityFetch(
   deps: AntigravityFetchDeps,
 ): (input: RequestInfo, init?: RequestInit) => Promise<Response> {
   const { getAuth, accountManager, client, config, providerId } = deps;
-  // Shadow global fetch with the pristine reference: passthrough and outbound
-  // calls (token refresh, endpoint requests) must never re-enter a patched
-  // globalThis.fetch installed by the V2 entry.
-  const fetch = deps.rawFetch;
   return async function antigravityPipelineFetch(input: RequestInfo, init?: RequestInit): Promise<Response> {
     // === 原 loader fetch 方法体（现 1455–2498 行）原样移入，不改一字 ===
   };
@@ -229,11 +236,9 @@ export function createAntigravityFetch(
 ```ts
       return {
         apiKey: "",
-        fetch: createAntigravityFetch({ getAuth, accountManager, client, config, providerId, rawFetch: globalThis.fetch }),
+        fetch: createAntigravityFetch({ getAuth, accountManager, client, config, providerId }),
       };
 ```
-
-（V1 进程从不补丁 fetch，`globalThis.fetch` 在 V1 下即 pristine fetch，行为等价。）
 
 - [ ] **Step 4: 跑新测试与全量回归**
 
@@ -355,79 +360,283 @@ git commit -m "feat(v2): accounts-file backed getAuth adapter"
 
 ---
 
-### Task 4: V2 入口 src/v2/index.ts（setup + fetch 补丁）
+### Task 4: V2 入口 src/v2/index.ts（loopback server + http.request hook）
 
 **Files:**
-- Create: `src/v2/index.ts`
-- Test: `src/v2/index.test.ts`
-- Modify: `docs/superpowers/specs/2026-10-07-antigravity-auth-v2-port-design.md`（cleanup 措辞改为"清定时器；fetch 补丁按进程生命周期保留，幂等防嵌套"，与本任务实现一致）
+- Create: `src/v2/index.ts`、`src/v2/loopback.ts`
+- Test: `src/v2/index.test.ts`、`src/v2/loopback.test.ts`
 
 **Interfaces:**
-- Consumes: Task 2 的 `createAntigravityFetch`、`buildAuthSuccessFromStoredAccount`；Task 3 的 `createAccountsGetAuth`；`loadConfig/initRuntimeConfig`（`src/plugin/config`）、`initializeDebug`（`src/plugin/debug`）、`initLogger`（`src/plugin/logger`）、`initAntigravityVersion`（`src/plugin/version`）、`initHealthTracker/initTokenTracker`（`src/plugin/rotation`）、`initDiskSignatureCache`（`src/plugin/cache`）、`AccountManager`、`loadAccounts`（`src/plugin/storage`）、`refreshAccessToken`/`accessTokenExpired`/`isOAuthAuth`（`src/plugin/auth`、`src/plugin/token`）、`isGenerativeLanguageRequest`（`src/plugin/request`）、`ANTIGRAVITY_PROVIDER_ID`（`src/constants`）
-- Produces: `installFetchIntercept(pipeline) => void`（导出供测试）；`default`（Plugin 定义，Task 5 接到根 index.ts）
+- Consumes: Task 2 的 `createAntigravityFetch`、`buildAuthSuccessFromStoredAccount`；Task 3 的 `createAccountsGetAuth`；`loadConfig/initRuntimeConfig`（`src/plugin/config`）、`initializeDebug`（`src/plugin/debug`）、`initLogger`（`src/plugin/logger`）、`initAntigravityVersion`（`src/plugin/version`）、`initHealthTracker/initTokenTracker`（`src/plugin/rotation`）、`initDiskSignatureCache`（`src/plugin/cache`）、`AccountManager`、`loadAccounts`（`src/plugin/storage`）、`refreshAccessToken`（`src/plugin/token`）、`accessTokenExpired/isOAuthAuth`（`src/plugin/auth`）、`isGenerativeLanguageRequest`（`src/plugin/request`）、`ANTIGRAVITY_PROVIDER_ID`（`src/constants`）
+- Produces: `createLoopbackServer(pipeline)`（loopback.ts，Task 4 内部用 + 测试用）、`rewriteRequestToLoopback(request, port)`（loopback.ts）、`default`（Plugin 定义，Task 5 接到根 index.ts）
 
-- [ ] **Step 1: 写失败测试**
+**设计要点（锁定）：**
+- hook 改道：`event.request = new Request(loopbackUrl, event.request)` + 追加头 `x-antigravity-original-url: <原始 URL>`。改道后的 URL 不命中 `isGenerativeLanguageRequest`，重复注册的 hook 自然跳过（幂等免费获得）。
+- loopback handler：读出请求体 → 用原始 URL 头重建 `Request` → `pipeline(request)` → 把 Response 的 status/headers/body（含 web ReadableStream）桥接回 node:http 的 res。
+- 单例：server 与 pipeline 模块级共享（多个 location 实例复用同一个）。
 
-`src/v2/index.test.ts`：
+- [ ] **Step 1: 写 loopback 的失败测试**
+
+`src/v2/loopback.test.ts`：
 
 ```ts
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { installFetchIntercept } from "./index";
+import { describe, it, expect, afterEach } from "vitest";
+import { createLoopbackServer, rewriteRequestToLoopback, ORIGINAL_URL_HEADER } from "./loopback";
 
-const GENERATIVE_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse";
+const servers: Array<ReturnType<typeof createLoopbackServer>> = [];
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((s) => s.close()));
+});
 
-describe("installFetchIntercept", () => {
-  let underlying: ReturnType<typeof vi.fn>;
-  let pipeline: ReturnType<typeof vi.fn>;
+const GENERATIVE_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse";
 
-  beforeEach(() => {
-    underlying = vi.fn(async () => new Response("raw"));
-    pipeline = vi.fn(async () => new Response("pipeline"));
-    vi.stubGlobal("fetch", underlying);
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("passes non-matching URLs to the underlying fetch untouched", async () => {
-    installFetchIntercept(pipeline);
-    const res = await fetch("https://registry.npmjs.org/foo", { method: "HEAD" });
-    expect(await res.text()).toBe("raw");
-    expect(underlying).toHaveBeenCalledWith("https://registry.npmjs.org/foo", { method: "HEAD" });
-    expect(pipeline).not.toHaveBeenCalled();
-  });
-
-  it("routes generative-language URLs into the pipeline", async () => {
-    installFetchIntercept(pipeline);
-    const res = await fetch(GENERATIVE_URL);
-    expect(await res.text()).toBe("pipeline");
-    expect(underlying).not.toHaveBeenCalled();
+describe("rewriteRequestToLoopback", () => {
+  it("redirects a generative request to the loopback origin and preserves method/headers/body", async () => {
+    const req = new Request(GENERATIVE_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer placeholder" },
+      body: JSON.stringify({ contents: [] }),
+    });
+    const rewritten = rewriteRequestToLoopback(req, 37899);
+    expect(rewritten.url).toBe("http://127.0.0.1:37899/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse");
+    expect(rewritten.method).toBe("POST");
+    expect(rewritten.headers.get(ORIGINAL_URL_HEADER)).toBe(GENERATIVE_URL);
+    expect(rewritten.headers.get("authorization")).toBe("Bearer placeholder");
+    await expect(rewritten.text()).resolves.toContain("contents");
   });
 
-  it("returns a guided 503 for intercepted requests when no pipeline exists", async () => {
-    installFetchIntercept(null);
-    const res = await fetch(GENERATIVE_URL);
+  it("leaves non-generative requests untouched", () => {
+    const req = new Request("https://example.com/v1/x");
+    expect(rewriteRequestToLoopback(req, 37899)).toBe(req);
+  });
+});
+
+describe("createLoopbackServer", () => {
+  it("rebuilds the original request and returns the pipeline response", async () => {
+    let seen: { url: string; method: string; body: string } | null = null;
+    const pipeline = async (input: RequestInfo): Promise<Response> => {
+      const r = input as Request;
+      seen = { url: r.url, method: r.method, body: await r.text() };
+      return new Response("pipeline-says", { status: 299, headers: { "content-type": "text/plain" } });
+    };
+    const server = createLoopbackServer(pipeline as never);
+    servers.push(server);
+    const port = await server.listen();
+    expect(port).toBeGreaterThan(0);
+
+    const res = await fetch(`http://127.0.0.1:${port}/v1beta/models/x:generateContent`, {
+      method: "POST",
+      headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL, "content-type": "application/json" },
+      body: "hello-body",
+    });
+    expect(res.status).toBe(299);
+    await expect(res.text()).resolves.toBe("pipeline-says");
+    expect(seen).not.toBeNull();
+    expect((seen as NonNullable<typeof seen>).url).toBe(GENERATIVE_URL);
+    expect((seen as NonNullable<typeof seen>).body).toBe("hello-body");
+  });
+
+  it("streams SSE bodies through chunk by chunk", async () => {
+    const chunks = ["data: {\"a\":1}\n\n", "data: {\"a\":2}\n\n"];
+    const pipeline = async (): Promise<Response> =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const c of chunks) controller.enqueue(new TextEncoder().encode(c));
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    const server = createLoopbackServer(pipeline as never);
+    servers.push(server);
+    const port = await server.listen();
+    const res = await fetch(`http://127.0.0.1:${port}/x`, { headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL } });
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    await expect(res.text()).resolves.toBe(chunks.join(""));
+  });
+
+  it("responds 503 with guidance when pipeline is absent", async () => {
+    const server = createLoopbackServer(null);
+    servers.push(server);
+    const port = await server.listen();
+    const res = await fetch(`http://127.0.0.1:${port}/x`, { headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL } });
     expect(res.status).toBe(503);
-    expect(await res.text()).toMatch(/antigravity-auth/i);
-  });
-
-  it("installs at most once per process (idempotent, no wrapper chaining)", async () => {
-    installFetchIntercept(pipeline);
-    installFetchIntercept(pipeline);
-    await fetch(GENERATIVE_URL);
-    expect(pipeline).toHaveBeenCalledTimes(1);
+    await expect(res.text()).resolves.toMatch(/antigravity-auth/i);
   });
 });
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
+Run: `npx vitest run src/v2/loopback.test.ts`
+Expected: FAIL，无法解析 `./loopback`。
+
+- [ ] **Step 3: 实现 loopback.ts**
+
+`src/v2/loopback.ts`：
+
+```ts
+import { createServer, type Server } from "node:http";
+import { Readable } from "node:stream";
+
+export const ORIGINAL_URL_HEADER = "x-antigravity-original-url";
+
+export type PipelineFetch = (input: RequestInfo, init?: RequestInit) => Promise<Response>;
+
+/** Redirect a generative-language request to the loopback origin, carrying the
+ *  original URL in a header; non-generative requests are returned untouched. */
+export function rewriteRequestToLoopback(request: Request, port: number): Request {
+  if (!isGenerativeLanguageRequestUrl(request.url)) return request;
+  const original = new URL(request.url);
+  const target = new URL(request.url);
+  target.protocol = "http:";
+  target.host = `127.0.0.1:${port}`;
+  const headers = new Headers(request.headers);
+  headers.set(ORIGINAL_URL_HEADER, request.url);
+  return new Request(target.toString(), {
+    method: request.method,
+    headers,
+    body: request.body,
+    duplex: "half",
+  } as RequestInit);
+}
+
+export interface LoopbackHandle {
+  port: number;
+  close(): Promise<void>;
+}
+
+function isGenerativeLanguageRequestUrl(url: string): boolean {
+  try {
+    return new URL(url).hostname === "generativelanguage.googleapis.com";
+  } catch {
+    return false;
+  }
+}
+
+/** Bridges node:http req/res to the fetch-shaped pipeline. */
+export function createLoopbackServer(pipeline: PipelineFetch | null): LoopbackHandle & { listen(): Promise<number> } {
+  const server: Server = createServer((req, res) => {
+    void (async () => {
+      try {
+        const originalUrl = req.headers[ORIGINAL_URL_HEADER];
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const body = Buffer.concat(chunks);
+
+        if (!pipeline || typeof originalUrl !== "string") {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: {
+                message:
+                  "opencode-antigravity-auth (V2): no accounts configured. " +
+                  "Re-login needs the V1 flow until the V2 login port lands (see docs/superpowers/specs).",
+              },
+            }),
+          );
+          return;
+        }
+
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(req.headers)) {
+          if (value === undefined) continue;
+          if (name === ORIGINAL_URL_HEADER || name === "host" || name === "connection" || name === "content-length") continue;
+          for (const v of Array.isArray(value) ? value : [value]) headers.append(name, v);
+        }
+
+        const request = new Request(originalUrl, {
+          method: req.method,
+          headers,
+          body: body.length > 0 ? body : undefined,
+        });
+
+        const response = await pipeline(request);
+        const outHeaders: Record<string, string> = {};
+        response.headers.forEach((v, k) => {
+          if (k === "content-length" || k === "transfer-encoding" || k === "connection" || k === "content-encoding") return;
+          outHeaders[k] = v;
+        });
+        res.writeHead(response.status, outHeaders);
+        if (!response.body) {
+          res.end();
+          return;
+        }
+        Readable.fromWeb(response.body as never).pipe(res);
+      } catch (error) {
+        if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `loopback failure: ${String(error)}` } }));
+      }
+    })();
+  });
+
+  return {
+    listen: () =>
+      new Promise<number>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+          const addr = server.address();
+          if (addr && typeof addr === "object") resolve(addr.port);
+          else reject(new Error("no port"));
+        });
+      }),
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections?.();
+      }),
+  };
+}
+```
+
+（注意：`isGenerativeLanguageRequest` 若在 `src/plugin/request.ts` 的导出签名可直接复用，则用它替换本地的 `isGenerativeLanguageRequestUrl`——实现时核对签名后择一，删除另一个。）
+
+- [ ] **Step 4: 跑 loopback 测试确认通过**
+
+Run: `npx vitest run src/v2/loopback.test.ts && npm run typecheck`
+Expected: 5 支全 PASS。
+
+- [ ] **Step 5: 写 v2 入口的失败测试**
+
+`src/v2/index.test.ts`（只测可纯测的部分：hook 的注册与改道委托。setup 的端到端在 Task 7 E2E 覆盖）：
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+import { buildRequestHook } from "./index";
+import { ORIGINAL_URL_HEADER } from "./loopback";
+
+const GENERATIVE_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse";
+
+describe("buildRequestHook", () => {
+  it("rewrites generative requests to the loopback origin with the original-url header", () => {
+    const port = 37899;
+    const hook = buildRequestHook(port);
+    const event = { request: new Request(GENERATIVE_URL, { method: "POST", body: "{}" }), kind: "primary", sessionID: "s", headers: {} } as never;
+    hook(event);
+    const req = (event as { request: Request }).request;
+    expect(req.url).toContain(`http://127.0.0.1:${port}/`);
+    expect(req.headers.get(ORIGINAL_URL_HEADER)).toBe(GENERATIVE_URL);
+  });
+
+  it("leaves non-generative requests untouched", () => {
+    const hook = buildRequestHook(37899);
+    const original = new Request("https://api.example.com/v1/x");
+    const event = { request: original, kind: "primary", sessionID: "s", headers: {} } as never;
+    hook(event);
+    expect((event as { request: Request }).request).toBe(original);
+  });
+});
+```
+
+- [ ] **Step 6: 跑测试确认失败**
+
 Run: `npx vitest run src/v2/index.test.ts`
-Expected: FAIL，无法解析 `./index`。
+Expected: FAIL，无法解析 `./index`（或 buildRequestHook 未导出）。
 
-- [ ] **Step 3: 实现**
-
-`src/v2/index.ts`：
+- [ ] **Step 7: 实现 src/v2/index.ts**
 
 ```ts
 import { Plugin } from "@opencode/plugin";
@@ -441,16 +650,13 @@ import { initHealthTracker, initTokenTracker } from "../plugin/rotation";
 import { AccountManager } from "../plugin/accounts";
 import { loadAccounts } from "../plugin/storage";
 import { createAntigravityFetch, buildAuthSuccessFromStoredAccount } from "../plugin";
-import { isGenerativeLanguageRequest } from "../plugin/request";
 import { accessTokenExpired, isOAuthAuth } from "../plugin/auth";
 import { refreshAccessToken } from "../plugin/token";
 import type { PluginClient } from "../plugin/types";
 import { createAccountsGetAuth } from "./getauth";
+import { createLoopbackServer, rewriteRequestToLoopback, type PipelineFetch } from "./loopback";
 
 const REFRESH_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const PATCH_MARKER = Symbol.for("antigravity-auth.fetch-patch");
-
-type PipelineFetch = (input: RequestInfo, init?: RequestInit) => Promise<Response>;
 
 function makeStubClient(): PluginClient {
   return {
@@ -484,35 +690,24 @@ function initTrackers(config: AntigravityConfig): void {
   }
 }
 
-/**
- * Patches globalThis.fetch for the server process lifetime. Idempotent via a
- * symbol marker: opencode loads one plugin instance per location, so setup may
- * run repeatedly in the same process. The disposer intentionally does not
- * unpatch — sibling instances still depend on the wrapper; the process exit
- * is the only unload boundary that matters here.
- */
-export function installFetchIntercept(pipeline: PipelineFetch | null): void {
-  const current = globalThis.fetch as typeof fetch & { [PATCH_MARKER]?: true };
-  if (current[PATCH_MARKER]) return;
-  const rawFetch = current.bind(globalThis);
-  const wrapper: PipelineFetch & { [PATCH_MARKER]?: true } = async (input, init) => {
-    if (!isGenerativeLanguageRequest(input)) return rawFetch(input, init);
-    if (!pipeline) {
-      return new Response(
-        JSON.stringify({
-          error: {
-            message:
-              "opencode-antigravity-auth (V2): no accounts configured. " +
-              "Re-login needs the V1 flow until the V2 login port lands (see docs/superpowers/specs).",
-          },
-        }),
-        { status: 503, headers: { "content-type": "application/json" } },
-      );
-    }
-    return pipeline(input, init);
+/** Module-level singleton: opencode loads one plugin instance per location,
+ *  and every instance must share one loopback server and pipeline. */
+const state: { pipeline: PipelineFetch | null; handle: Awaited<ReturnType<typeof startLoopback>> | null } = {
+  pipeline: null,
+  handle: null,
+};
+
+async function startLoopback(pipeline: PipelineFetch | null) {
+  const server = createLoopbackServer(pipeline);
+  const port = await server.listen();
+  return { port, close: server.close };
+}
+
+/** Exported for tests: the raw hook body. */
+export function buildRequestHook(port: number) {
+  return (event: { request: Request }) => {
+    event.request = rewriteRequestToLoopback(event.request, port);
   };
-  wrapper[PATCH_MARKER] = true;
-  globalThis.fetch = wrapper as typeof fetch;
 }
 
 export default Plugin.define({
@@ -529,64 +724,62 @@ export default Plugin.define({
     const stored = await loadAccounts();
     const accounts = stored?.accounts ?? [];
 
-    let pipeline: PipelineFetch | null = null;
-    if (accounts.length > 0) {
-      const authFallback = buildAuthSuccessFromStoredAccount(accounts[0]);
-      const accountManager = await AccountManager.loadFromDisk(authFallback);
-      if (accountManager.getAccountCount() > 0) accountManager.requestSaveToDisk();
-      const getAuth = createAccountsGetAuth(accountManager);
-      // Capture rawFetch BEFORE installing the intercept.
-      const rawFetch = globalThis.fetch.bind(globalThis);
-      pipeline = createAntigravityFetch({
-        getAuth,
-        accountManager,
-        client: makeStubClient(),
-        config,
-        providerId: ANTIGRAVITY_PROVIDER_ID,
-        rawFetch: rawFetch as typeof fetch,
-      });
+    if (!state.handle) {
+      if (accounts.length > 0) {
+        const authFallback = buildAuthSuccessFromStoredAccount(accounts[0]);
+        const accountManager = await AccountManager.loadFromDisk(authFallback);
+        if (accountManager.getAccountCount() > 0) accountManager.requestSaveToDisk();
+        const getAuth = createAccountsGetAuth(accountManager);
+        state.pipeline = createAntigravityFetch({
+          getAuth,
+          accountManager,
+          client: makeStubClient(),
+          config,
+          providerId: ANTIGRAVITY_PROVIDER_ID,
+        });
 
-      // Best-effort proactive refresh (per-request refresh inside the
-      // pipeline remains the load-bearing path).
-      const timer = setInterval(() => {
-        void (async () => {
-          try {
-            const auth = await getAuth();
-            if (!isOAuthAuth(auth) || !accessTokenExpired(auth)) return;
-            await refreshAccessToken(auth, makeStubClient(), ANTIGRAVITY_PROVIDER_ID);
-          } catch {
-            /* refresh failure surfaces per-request via the pipeline */
-          }
-        })();
-      }, REFRESH_CHECK_INTERVAL_MS);
+        const timer = setInterval(() => {
+          void (async () => {
+            try {
+              const auth = await getAuth();
+              if (!isOAuthAuth(auth) || !accessTokenExpired(auth)) return;
+              await refreshAccessToken(auth, makeStubClient(), ANTIGRAVITY_PROVIDER_ID);
+            } catch {
+              /* per-request refresh inside the pipeline is the load-bearing path */
+            }
+          })();
+        }, REFRESH_CHECK_INTERVAL_MS);
 
-      installFetchIntercept(pipeline);
-      return () => clearInterval(timer);
+        state.handle = await startLoopback(state.pipeline);
+        const handle = state.handle;
+        await ctx.session.hook("http.request", buildRequestHook(handle.port));
+        return () => {
+          clearInterval(timer);
+        };
+      }
+      state.handle = await startLoopback(null);
     }
-
-    installFetchIntercept(null);
+    const handle = state.handle;
+    await ctx.session.hook("http.request", buildRequestHook(handle.port));
     return () => {};
   },
 });
 ```
 
-注意：`installFetchIntercept` 内部自己再取 `current` 做 `rawFetch`（marker 命中时直接 return，不会二次包）；setup 里传入 pipeline 前捕获的 rawFetch 仅给管线内部使用。若 `isGenerativeLanguageRequest` 的入参类型是 `RequestInfo` 之外的形状（如只收 string），在 wrapper 里先转成 `toUrlString` 等价逻辑（对照 `src/plugin/request.ts` 签名）。
+（实现时以 typecheck 为准对齐 `ctx.session.hook` 的事件类型；hook 回调里只改 `event.request`。）
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 8: 跑入口测试与全量类型检查**
 
 Run: `npx vitest run src/v2/index.test.ts && npm run typecheck`
-Expected: 4 支全 PASS。
+Expected: 2 支 PASS，typecheck 无错。
 
-- [ ] **Step 5: 同步 spec 措辞并 Commit**
-
-编辑 spec 中「返回的 cleanup 恢复原始 fetch」段落为：「cleanup 仅清理刷新定时器；fetch 补丁以幂等 marker 保证进程内只装一次、不嵌套，随进程生命周期存在」。
+- [ ] **Step 9: Commit**
 
 ```bash
-git add src/v2/index.ts src/v2/index.test.ts docs/superpowers/specs/2026-10-07-antigravity-auth-v2-port-design.md
-git commit -m "feat(v2): Plugin.define entry with idempotent fetch intercept"
+git add src/v2/index.ts src/v2/index.test.ts src/v2/loopback.ts src/v2/loopback.test.ts
+git commit -m "feat(v2): loopback server + http.request hook entry"
 ```
 
----
 
 ### Task 5: 构建接线——SDK 依赖、根入口、产物验证
 
@@ -775,7 +968,8 @@ Expected: 出现 `loading plugin ... antigravity-auth@git+...` 且无紧随的 `
 
 ## Self-Review 记录
 
-- Spec 覆盖：入口/补丁/抽取/getAuth/配置迁移/错误处理/验证四阶段/风险项 → Task 4/2/2/3/7+8/4/1+7/（风险表为文档性内容，无任务需要）。spec 的"cleanup 恢复 fetch"在 Task 4 Step 5 同步修正为幂等保留语义（设计修正，理由已注明：多 location 实例共存）。
-- 占位符扫描：Task 2 Step 1 测试代码中的 `getRawAuthNever` 行已标注删除；其余无 TBD。
-- 类型一致性：`AntigravityFetchDeps`（Task 2 定义）在 Task 4 Step 3 以相同字段名消费；`installFetchIntercept` 签名在 Task 4 测试与实现一致；`createAccountsGetAuth` 签名在 Task 3/4 一致。
+- 2026-10-08 B' 修订：方案 A 否决（探针证据），Task 2 去掉 rawFetch（无补丁即无递归），Task 4 重写为 loopback server + http.request hook。spec 同步修订。
+- Spec 覆盖：入口/loopback+hook/抽取/getAuth/配置迁移/错误处理/验证四阶段/风险项 → Task 4/4/2/3/7+8/4/1+7/（风险表为文档性内容，无任务需要）。
+- 占位符扫描：无 TBD；所有代码块完整。
+- 类型一致性：`AntigravityFetchDeps`（Task 2 定义，无 rawFetch）在 Task 4 Step 7 以相同字段名消费；`createAccountsGetAuth`（Task 3）与 Task 4 一致；`rewriteRequestToLoopback`/`createLoopbackServer`/`ORIGINAL_URL_HEADER`（Task 4 loopback.ts）在 index.ts 与两个测试文件中一致。
 - Review Focus 五项均有对应测试任务（见各条目）。

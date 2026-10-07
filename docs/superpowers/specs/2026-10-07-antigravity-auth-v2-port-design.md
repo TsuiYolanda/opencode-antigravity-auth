@@ -41,21 +41,26 @@ opencode v2.0.16 重新可用以下 5 个模型（定义在 `~/.config/opencode/
 - 依赖：`@opencode-ai/plugin ^0.15.30`（V1 SDK）、zod 4、proper-lockfile、
   @openauthjs/openauth（仅登录流程用）。
 
-## 方案：V2 入口 + globalThis.fetch 补丁（已选定，方案 A）
+## 方案：V2 http.request hook + loopback server（B'，2026-10-08 探针后修订）
 
-核心思路：插件确认在 V2 server 进程内加载（日志 role=server 可见 entrypoint）。
-在 `setup()` 里猴补丁 `globalThis.fetch`，只拦截
-`isGenerativeLanguageRequest()` 命中的请求进入原有管线，其余原样放行。
-原有管线代码零行为改动，仅做一次位置抽取。
+核心思路：探针实证 V2 provider 运行时（Bun 打包）不走 `globalThis.fetch`，
+globalThis 补丁无法拦截（方案 A 于 Task 1 gate 否决）；同时实证
+`ctx.session.hook("http.request")` 可完整改写 provider 请求（URL/Request 替换生效，
+响应可达）。因此：`setup()` 注册 `http.request` hook，把命中
+`isGenerativeLanguageRequest()` 的请求**改道到插件自起的 loopback HTTP server**
+（127.0.0.1 随机端口）；server handler 从 `x-antigravity-original-url` 头还原原始
+Request，调用**原封不动的 V1 管线**（它本来就是 `fetch(input, init) → Response`
+形状），把 Response（含 SSE 流）桥接回 loopback 连接。管线零改动、多端点重试与
+账号切换语义完整保留；无需补丁全局、无需防递归。
 
-被否决的备选：B）改用 V2 `http.request`/`http.response` hook 重写传输层——
-多端点重试/账号切换横跨请求全生命周期，response hook 无法重新发请求，
-3451 行管线需大改；C）V2 integration + provider transform 全原生重写——
-数周工作量，超出最小范围。
+被否决的备选：A）globalThis.fetch 补丁——探针否决（provider 运行时持有独立
+fetch 引用）；B）把管线拆进 http.request/http.response 两个 hook——多端点重试
+横跨请求全生命周期，response hook 无法重新发请求，需大改管线结构；C）V2
+integration + provider transform 全原生重写——数周工作量，超出最小范围。
 
 ### 组件设计
 
-1. **V2 入口 `src/v2.ts`（新增，约 200-400 行）**
+1. **V2 入口 `src/v2/`（新增）**
 
    ```ts
    import { Plugin } from "@opencode/plugin"
@@ -65,14 +70,17 @@ opencode v2.0.16 重新可用以下 5 个模型（定义在 `~/.config/opencode/
      async setup(ctx) {
        // 1. loadConfig()/initRuntimeConfig() 读 antigravity.json
        // 2. initLogger / initializeDebug
-       // 3. loadAccounts()；无账号 → 记录错误，仍继续装补丁（请求返回指引性错误）
+       // 3. loadAccounts()；无账号 → pipeline 置空（请求返回指引性 503）
        // 4. initHealthTracker / initTokenTracker / initDiskSignatureCache
-       // 5. const pipeline = createAntigravityFetch(deps)  // deps 含 toast stub
-       // 6. 补丁 globalThis.fetch（幂等保护，防重复装载）
-       // 7. token 主动刷新定时器：简化 interval（每 5 分钟检查临期 token 并
-       //    调用现有 refreshAccessToken；管线内按需刷新兜底），不移植完整
-       //    refresh-queue 模块
-       // return cleanup：恢复原始 fetch、清定时器
+       // 5. pipeline = createAntigravityFetch(deps)（fetch 形状，内部用真实 fetch）
+       // 6. 起 loopback HTTP server（127.0.0.1 随机端口，模块级单例）：
+       //    handler 读 x-antigravity-original-url 头还原原始 Request，
+       //    调 pipeline(request)，把 Response 桥接回连接（流式透传）
+       // 7. ctx.session.hook("http.request")：命中 isGenerativeLanguageRequest 的
+       //    请求改写为 loopback URL + 注入 x-antigravity-original-url 头
+       // 8. token 主动刷新 interval（每 5 分钟检查临期 token 并调用现有
+       //    refreshAccessToken；管线内按需刷新兜底）
+       // return cleanup：关 loopback server、清 interval
      },
    })
    ```
@@ -88,7 +96,8 @@ opencode v2.0.16 重新可用以下 5 个模型（定义在 `~/.config/opencode/
    闭包内对 V1 `client`（toast/事件）的依赖改为通过 `deps` 注入 stub：
    toast → 写入现有 debug 日志文件。循环体（端点回退、账号切换、warmup、
    流转换、429 处理）逐行保留，不改语义。V1 Plugin 函数本身保留并改用
-   同一工厂，保证 V1 行为不回归（上游 vitest 套件可继续跑）。
+   同一工厂，保证 V1 行为不回归（上游 vitest 套件可继续跑）。管线内部
+   的出站请求直接用真实 `globalThis.fetch`（无补丁、无递归风险）。
 
 3. **`index.ts`（改动）**：保留原命名导出，追加
    `export { default } from "./src/v2"`。
@@ -114,8 +123,10 @@ opencode v2.0.16 重新可用以下 5 个模型（定义在 `~/.config/opencode/
   `createSyntheticErrorResponse` 返回带指引的错误（提示用 V1 opencode
   重新登录，或等待后续版本补登录流程）。
 - token 刷新失败：沿用现有 `AntigravityTokenRefreshError` 路径与重试语义。
-- fetch 补丁冲突：装载前检测是否已被本插件补丁过（幂等）；cleanup 恢复
-  原始引用。
+- loopback server 生命周期：模块级单例（多个 location 实例共享一个 server），
+  cleanup 关闭 server 与刷新定时器；端口用 `listen(0)` 随机分配，避免冲突。
+- hook 幂等：`http.request` 改道后 URL 已非 generativelanguage，重复注册的
+  hook 自然跳过，无需额外防护。
 
 ## 明确不移植（最小版边界）
 
@@ -129,11 +140,11 @@ TUI toast（改日志 stub）、会话恢复 hook（tool_result_missing 自动�
 
 ## 验证方案
 
-1. **探针（前置门槛）**：10 行临时 V2 插件补丁 `globalThis.fetch` 并打日志，
-   以 `opencode --standalone` + 任意模型请求确认 V2 server 的 provider 请求
-   走 `globalThis.fetch`。失败则整个方案 A 作废，退方案 B 并重新设计。
+1. **探针（前置门槛，已完成）**：实证 V2 provider 请求不走 `globalThis.fetch`
+   （方案 A 否决），实证 `http.request` hook 可改写 URL 且响应可达（B' 依据）。
 2. **单测**：跑上游 vitest 全量套件（约 40+ 测试文件），验证抽取重构
-   无回归；为 `src/v2.ts` 补最小单测（无账号报错路径、非 Google URL 放行）。
+   无回归；为 `src/v2/` 补最小单测（无账号 503 路径、非 Google URL 放行、
+   loopback 还原原始 URL、流式桥接）。
 3. **本地实测**：`file://` 引用 dist 路径，5 个模型各发一条（含流式与
    工具调用至少一轮）。
 4. **收尾**：改 git 引用 + `opencode service restart`，确认日志无
@@ -143,10 +154,10 @@ TUI toast（改日志 stub）、会话恢复 hook（tool_result_missing 自动�
 
 | 风险 | 概率 | 缓解 |
 | --- | --- | --- |
-| V2 provider 请求不走 globalThis.fetch | 低 | 探针先行；失败退方案 B |
+| loopback 桥接破坏 SSE 流（node/http ↔ web stream） | 中 | Task 4 单测覆盖流式透传；E2E 实测 5 模型 |
 | 抽取重构破坏 V1 管线 | 低 | vitest 全量 + 行为对照 |
-| V2 server 用 undici dispatcher 绕过补丁 | 低 | wrapper 透传 init，不改 dispatcher |
 | provider 无凭据被禁用 | 中 | 占位 apiKey，实测确认 |
+| Bun 的 node:http 行为差异 | 低 | server 实现只用稳定 API（createServer/Readable.fromWeb） |
 | 上游 main 后续大改难合并 | 中 | 独立 `v2-port` 分支，按需 rebase |
 
 ## 后续路线（本次不做）
