@@ -788,6 +788,9 @@ export function prepareAntigravityRequest(
 
   headers.set("Authorization", `Bearer ${accessToken}`);
   headers.delete("x-api-key");
+  // opencode V2's google provider can pass a stored OAuth access token via
+  // x-goog-api-key; the endpoint rejects stale tokens as invalid API keys.
+  headers.delete("x-goog-api-key");
   // Strip x-goog-user-project header to prevent 403 auth/license conflicts.
   // This header is added by OpenCode/AI SDK and can force project-level checks
   // that are not required for Antigravity/Gemini CLI OAuth requests.

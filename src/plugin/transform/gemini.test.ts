@@ -1478,3 +1478,51 @@ describe("transform/gemini", () => {
     });
   });
 });
+
+describe("wrapToolsAsFunctionDeclarations with opencode V2 declaration shape", () => {
+  it("sanitizes parametersJsonSchema into Gemini format and filters required", () => {
+    const payload = {
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: "edit",
+              description: "d",
+              parametersJsonSchema: {
+                type: "object",
+                properties: { path: { type: "string" }, pattern: { type: "string" } },
+                required: ["path", "ghost"],
+                additionalProperties: false,
+              },
+            },
+          ],
+        },
+      ],
+    } as never;
+    const result = wrapToolsAsFunctionDeclarations(payload);
+    const decl = (payload.tools as Array<{ functionDeclarations: Array<Record<string, unknown>> }>)[0]
+      .functionDeclarations[0]!;
+    expect(result.wrappedFunctionCount).toBe(1);
+    expect(decl.parameters).toEqual({
+      type: "OBJECT",
+      properties: { path: { type: "STRING" }, pattern: { type: "STRING" } },
+      required: ["path"],
+    });
+  });
+});
+
+describe("toGeminiSchema - numeric/string constraint keywords (Antigravity VALIDATED mode)", () => {
+  it("strips exclusiveMinimum, exclusiveMaximum, minLength, multipleOf, uniqueItems", () => {
+    const out = toGeminiSchema({
+      type: "integer",
+      exclusiveMinimum: 0,
+      exclusiveMaximum: 10,
+      minLength: 1,
+      multipleOf: 2,
+      uniqueItems: true,
+      minimum: 1,
+      maximum: 9,
+    });
+    expect(out).toEqual({ type: "INTEGER", minimum: 1, maximum: 9 });
+  });
+});
