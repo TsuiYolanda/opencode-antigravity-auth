@@ -44,14 +44,25 @@ export function createLoopbackServer(pipeline: PipelineFetch | null): LoopbackHa
     void (async () => {
       let settled = false;
       const abort = new AbortController();
-      req.on("close", () => {
-        if (!settled) abort.abort(new Error("client disconnected"));
+      // res 'close' with writableEnded false is the portable client-disconnect
+      // signal (Bun emits req 'close' once the request body is consumed).
+      res.on("close", () => {
+        if (!settled && !res.writableEnded) abort.abort(new Error("client disconnected"));
       });
       try {
         const originalUrl = req.headers[ORIGINAL_URL_HEADER];
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk as Buffer);
         const body = Buffer.concat(chunks);
+        if (process.env.AGA_DUMP_BODY) {
+          try {
+            const { appendFileSync } = await import("node:fs");
+            const { tmpdir } = await import("node:os");
+            appendFileSync(`${tmpdir()}/aga-loopback-dump.json`, `${originalUrl ?? "?"}\n${body.toString("utf8")}\n\n`);
+          } catch {
+            /* dump is best-effort */
+          }
+        }
 
         if (!pipeline || typeof originalUrl !== "string") {
           res.writeHead(503, { "content-type": "application/json" });
@@ -73,10 +84,12 @@ export function createLoopbackServer(pipeline: PipelineFetch | null): LoopbackHa
           for (const v of Array.isArray(value) ? value : [value]) headers.append(name, v);
         }
 
+        // prepareAntigravityRequest transforms string bodies only; a Buffer
+        // would bypass the Gemini→Antigravity rewrite and fail at the endpoint.
         const response = await pipeline(originalUrl, {
           method: req.method,
           headers,
-          body: body.length > 0 ? body : undefined,
+          body: body.length > 0 ? body.toString("utf8") : undefined,
           signal: abort.signal,
         });
 

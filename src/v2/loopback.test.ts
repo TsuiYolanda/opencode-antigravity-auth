@@ -37,9 +37,11 @@ describe("createLoopbackServer", () => {
     let seenUrl = "";
     let seenMethod = "";
     let seenBody = "";
+    let seenBodyType = "";
     const pipeline = async (input: RequestInfo, init?: RequestInit): Promise<Response> => {
       seenUrl = String(input);
       seenMethod = init?.method ?? "?";
+      seenBodyType = typeof init?.body;
       seenBody = init?.body ? String(init.body) : "";
       return new Response("pipeline-says", { status: 299, headers: { "content-type": "text/plain" } });
     };
@@ -57,6 +59,9 @@ describe("createLoopbackServer", () => {
     await expect(res.text()).resolves.toBe("pipeline-says");
     expect(seenUrl).toBe(GENERATIVE_URL);
     expect(seenMethod).toBe("POST");
+    // prepareAntigravityRequest only transforms string bodies (request.ts:833);
+    // a Buffer body would bypass transformation and 400 at the endpoint.
+    expect(seenBodyType).toBe("string");
     expect(seenBody).toBe("hello-body");
   });
 
@@ -91,5 +96,50 @@ describe("createLoopbackServer", () => {
     });
     expect(res.status).toBe(503);
     await expect(res.text()).resolves.toMatch(/antigravity-auth/i);
+  });
+});
+
+describe("createLoopbackServer abort semantics", () => {
+  it("does not abort the pipeline when the request body is fully consumed", async () => {
+    let aborted = false;
+    const pipeline = async (_input: RequestInfo, init?: RequestInit): Promise<Response> => {
+      const signal = init?.signal;
+      if (signal) signal.addEventListener("abort", () => { aborted = true; });
+      await new Promise((r) => setTimeout(r, 150));
+      return new Response("late-but-fine", { status: 200 });
+    };
+    const handle = createLoopbackServer(pipeline);
+    handles.push(handle);
+    const port = await handle.listen();
+    const res = await fetch(`http://127.0.0.1:${port}/x`, {
+      method: "POST",
+      headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL, "content-type": "application/json" },
+      body: "body-fully-consumed",
+    });
+    expect(res.status).toBe(200);
+    await expect(res.text()).resolves.toBe("late-but-fine");
+    expect(aborted).toBe(false);
+  });
+
+  it("aborts the pipeline when the client disconnects mid-flight", async () => {
+    let signal: AbortSignal | undefined;
+    const pipeline = async (_input: RequestInfo, init?: RequestInit): Promise<Response> => {
+      signal = init?.signal;
+      await new Promise((r) => setTimeout(r, 10_000));
+      return new Response("never", { status: 200 });
+    };
+    const handle = createLoopbackServer(pipeline);
+    handles.push(handle);
+    const port = await handle.listen();
+    const controller = new AbortController();
+    const attempt = fetch(`http://127.0.0.1:${port}/x`, {
+      headers: { [ORIGINAL_URL_HEADER]: GENERATIVE_URL },
+      signal: controller.signal,
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    controller.abort();
+    await expect(attempt).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(signal?.aborted).toBe(true);
   });
 });
