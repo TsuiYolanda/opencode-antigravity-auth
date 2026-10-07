@@ -1481,7 +1481,7 @@ describe("transform/gemini", () => {
 
 describe("wrapToolsAsFunctionDeclarations with opencode V2 declaration shape", () => {
   it("sanitizes parametersJsonSchema into Gemini format and filters required", () => {
-    const payload = {
+    const payload: RequestPayload = {
       tools: [
         {
           functionDeclarations: [
@@ -1494,16 +1494,16 @@ describe("wrapToolsAsFunctionDeclarations with opencode V2 declaration shape", (
                 required: ["path", "ghost"],
                 additionalProperties: false,
               },
-            },
+            } as Record<string, unknown>,
           ],
         },
       ],
-    } as never;
+    };
     const result = wrapToolsAsFunctionDeclarations(payload);
-    const decl = (payload.tools as Array<{ functionDeclarations: Array<Record<string, unknown>> }>)[0]
-      .functionDeclarations[0]!;
+    const toolEntries = payload.tools as Array<{ functionDeclarations: Array<Record<string, unknown>> }>;
+    const decl = toolEntries[0]?.functionDeclarations[0] as Record<string, unknown>;
     expect(result.wrappedFunctionCount).toBe(1);
-    expect(decl.parameters).toEqual({
+    expect(decl!["parameters"]).toEqual({
       type: "OBJECT",
       properties: { path: { type: "STRING" }, pattern: { type: "STRING" } },
       required: ["path"],

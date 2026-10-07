@@ -124,7 +124,7 @@ describe("createLoopbackServer abort semantics", () => {
   it("aborts the pipeline when the client disconnects mid-flight", async () => {
     let signal: AbortSignal | undefined;
     const pipeline = async (_input: RequestInfo, init?: RequestInit): Promise<Response> => {
-      signal = init?.signal;
+      signal = init?.signal ?? undefined;
       await new Promise((r) => setTimeout(r, 10_000));
       return new Response("never", { status: 200 });
     };
