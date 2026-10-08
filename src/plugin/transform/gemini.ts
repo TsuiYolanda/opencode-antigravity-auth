@@ -47,6 +47,15 @@ const UNSUPPORTED_SCHEMA_FIELDS = new Set([
   "propertyNames",
   "minContains",
   "maxContains",
+  // JSON-Schema validation vocabulary unknown to the Antigravity protobuf
+  // schema ("Unknown name exclusiveMinimum ... Cannot find field").
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minLength",
+  "multipleOf",
+  "uniqueItems",
+  "minProperties",
+  "maxProperties",
 ]);
 
 export function toGeminiSchema(schema: unknown): unknown {
@@ -503,10 +512,20 @@ export function wrapToolsAsFunctionDeclarations(payload: RequestPayload): WrapTo
     if (tool.functionDeclarations) {
       if (Array.isArray(tool.functionDeclarations)) {
         for (const decl of tool.functionDeclarations as Array<Record<string, unknown>>) {
+          // opencode V2 sends JSON schemas as `parametersJsonSchema`; accept
+          // every field name shape and sanitize into Gemini VALIDATED format.
+          const rawSchema =
+            decl.parameters ??
+            decl.parametersJsonSchema ??
+            decl.input_schema ??
+            decl.inputSchema;
+          const schema = rawSchema
+            ? (toGeminiSchema(rawSchema) as Record<string, unknown>)
+            : { type: "OBJECT", properties: {} };
           functionDeclarations.push({
             name: String(decl.name || `tool-${functionDeclarations.length}`),
             description: String(decl.description || ""),
-            parameters: (decl.parameters as Record<string, unknown>) || { type: "OBJECT", properties: {} },
+            parameters: schema,
           });
         }
       }

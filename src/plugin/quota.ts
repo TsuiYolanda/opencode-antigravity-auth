@@ -8,7 +8,7 @@ import { logQuotaFetch, logQuotaStatus } from "./debug";
 import { ensureProjectContext } from "./project";
 import { refreshAccessToken } from "./token";
 import { getModelFamily } from "./transform/model-resolver";
-import type { PluginClient, OAuthAuthDetails } from "./types";
+import type { PipelineClient, OAuthAuthDetails } from "./types";
 import type { AccountMetadataV3 } from "./storage";
 
 const FETCH_TIMEOUT_MS = 10000;
@@ -309,7 +309,7 @@ function applyAccountUpdates(account: AccountMetadataV3, auth: OAuthAuthDetails)
 
 export async function checkAccountsQuota(
   accounts: AccountMetadataV3[],
-  client: PluginClient,
+  client: PipelineClient,
   providerId = ANTIGRAVITY_PROVIDER_ID,
 ): Promise<AccountQuotaResult[]> {
   const results: AccountQuotaResult[] = [];

@@ -3,7 +3,7 @@ import { formatRefreshParts, parseRefreshParts, calculateTokenExpiry } from "./a
 import { clearCachedAuth, storeCachedAuth } from "./cache";
 import { createLogger } from "./logger";
 import { invalidateProjectContextCache } from "./project";
-import type { OAuthAuthDetails, PluginClient, RefreshParts } from "./types";
+import type { OAuthAuthDetails, PipelineClient, RefreshParts } from "./types";
 
 const log = createLogger("token");
 
@@ -84,7 +84,7 @@ export class AntigravityTokenRefreshError extends Error {
  */
 export async function refreshAccessToken(
   auth: OAuthAuthDetails,
-  client: PluginClient,
+  client: PipelineClient,
   providerId: string,
 ): Promise<OAuthAuthDetails | undefined> {
   const parts = parseRefreshParts(auth.refresh);

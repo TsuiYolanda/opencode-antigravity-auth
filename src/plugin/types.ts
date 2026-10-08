@@ -1,4 +1,6 @@
 import type { PluginInput } from "@opencode-ai/plugin";
+import type { AccountManager } from "./accounts";
+import type { AntigravityConfig } from "./config";
 import type { AntigravityTokenExchangeResult } from "../antigravity/oauth";
 
 export interface OAuthAuthDetails {
@@ -110,3 +112,24 @@ export interface ProjectContextResult {
   effectiveProjectId: string;
 }
 
+
+/** The minimal client surface the request pipeline needs. V1 PluginClient satisfies this structurally. */
+export interface PipelineClient {
+  tui: {
+    showToast(input: { body: { message: string; variant: "info" | "warning" | "success" | "error" } }): Promise<unknown>;
+  };
+  auth: {
+    set(input: {
+      path: { id: string };
+      body: { type: "oauth"; refresh: string; access: string; expires: number };
+    }): Promise<unknown>;
+  };
+}
+
+export interface AntigravityFetchDeps {
+  getAuth: GetAuth;
+  accountManager: AccountManager;
+  client: PipelineClient;
+  config: AntigravityConfig;
+  providerId: string;
+}

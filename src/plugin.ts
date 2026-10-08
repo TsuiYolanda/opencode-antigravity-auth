@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { tool } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin/tool";
 import {
   ANTIGRAVITY_DEFAULT_PROJECT_ID,
   ANTIGRAVITY_ENDPOINT_FALLBACKS,
@@ -52,8 +52,10 @@ import { initHealthTracker, getHealthTracker, initTokenTracker, getTokenTracker 
 import { initAntigravityVersion } from "./plugin/version";
 import { executeSearch } from "./plugin/search";
 import type {
+  AntigravityFetchDeps,
   GetAuth,
   LoaderResult,
+  PipelineClient,
   PluginClient,
   PluginContext,
   PluginResult,
@@ -125,7 +127,7 @@ const quotaRefreshInProgressByEmail = new Set<string>();
 async function triggerAsyncQuotaRefreshForAccount(
   accountManager: AccountManager,
   accountIndex: number,
-  client: PluginClient,
+  client: PipelineClient,
   providerId: string,
   intervalMinutes: number,
 ): Promise<void> {
@@ -857,7 +859,7 @@ async function persistAccountPool(
   });
 }
 
-function buildAuthSuccessFromStoredAccount(account: {
+export function buildAuthSuccessFromStoredAccount(account: {
   refreshToken: string;
   projectId?: string;
   managedProjectId?: string;
@@ -1210,6 +1212,1058 @@ function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
 /**
  * Creates an Antigravity OAuth plugin for a specific provider ID.
  */
+export function createAntigravityFetch(
+  deps: AntigravityFetchDeps,
+): (input: RequestInfo, init?: RequestInit) => Promise<Response> {
+  const { getAuth, accountManager, client, config, providerId } = deps;
+  return async function antigravityPipelineFetch(input: RequestInfo, init?: RequestInit): Promise<Response> {
+    if (!isGenerativeLanguageRequest(input)) {
+      return fetch(input, init);
+    }
+
+    const latestAuth = await getAuth();
+    if (!isOAuthAuth(latestAuth)) {
+      return fetch(input, init);
+    }
+
+    if (accountManager.getAccountCount() === 0) {
+      throw new Error("No Antigravity accounts configured. Run `opencode auth login`.");
+    }
+
+    const urlString = toUrlString(input);
+    const family = getModelFamilyFromUrl(urlString);
+    const model = extractModelFromUrl(urlString);
+    const debugLines: string[] = [];
+    const pushDebug = (line: string) => {
+      if (!isDebugEnabled()) return;
+      debugLines.push(line);
+    };
+    pushDebug(`request=${urlString}`);
+
+    type FailureContext = {
+      response: Response;
+      streaming: boolean;
+      debugContext: ReturnType<typeof startAntigravityDebugRequest>;
+      requestedModel?: string;
+      projectId?: string;
+      endpoint?: string;
+      effectiveModel?: string;
+      sessionId?: string;
+      toolDebugMissing?: number;
+      toolDebugSummary?: string;
+      toolDebugPayload?: string;
+    };
+
+    let lastFailure: FailureContext | null = null;
+    let lastError: Error | null = null;
+    const abortSignal = init?.signal ?? undefined;
+
+    // Helper to check if request was aborted
+    const checkAborted = () => {
+      if (abortSignal?.aborted) {
+        throw abortSignal.reason instanceof Error ? abortSignal.reason : new Error("Aborted");
+      }
+    };
+
+    // Use while(true) loop to handle rate limits with backoff
+    // This ensures we wait and retry when all accounts are rate-limited
+    const quietMode = config.quiet_mode;
+    const toastScope = config.toast_scope;
+
+    // Helper to show toast without blocking on abort (respects quiet_mode and toast_scope)
+    const showToast = async (message: string, variant: "info" | "warning" | "success" | "error") => {
+      // Always log to debug regardless of toast filtering
+      log.debug("toast", { message, variant, isChildSession, toastScope });
+
+      if (quietMode) return;
+      if (abortSignal?.aborted) return;
+
+      // Filter toasts for child sessions when toast_scope is "root_only"
+      if (toastScope === "root_only" && isChildSession) {
+        log.debug("toast-suppressed-child-session", { message, variant, parentID: childSessionParentID });
+        return;
+      }
+
+      if (variant === "warning" && message.toLowerCase().includes("rate")) {
+        if (!shouldShowRateLimitToast(message)) {
+          return;
+        }
+      }
+
+      try {
+        await client.tui.showToast({
+          body: { message, variant },
+        });
+      } catch {
+        // TUI may not be available
+      }
+    };
+
+    const hasOtherAccountWithAntigravity = (currentAccount: any): boolean => {
+      if (family !== "gemini") return false;
+      // Use AccountManager method which properly checks for disabled/cooling-down accounts
+      return accountManager.hasOtherAccountWithAntigravityAvailable(currentAccount.index, family, model);
+    };
+
+    while (true) {
+      // Check for abort at the start of each iteration
+      checkAborted();
+
+      const accountCount = accountManager.getAccountCount();
+      const routingDecision = resolveHeaderRoutingDecision(urlString, family, config);
+      const {
+        cliFirst,
+        preferredHeaderStyle,
+        explicitQuota,
+        allowQuotaFallback,
+      } = routingDecision;
+
+      if (accountCount === 0) {
+        throw new Error("No Antigravity accounts available. Run `opencode auth login`.");
+      }
+
+      const softQuotaCacheTtlMs = computeSoftQuotaCacheTtlMs(
+        config.soft_quota_cache_ttl_minutes,
+        config.quota_refresh_interval_minutes,
+      );
+
+      let account = accountManager.getCurrentOrNextForFamily(
+        family, 
+        model, 
+        config.account_selection_strategy,
+        preferredHeaderStyle,
+        config.pid_offset_enabled,
+        config.soft_quota_threshold_percent,
+        softQuotaCacheTtlMs,
+      );
+
+      if (!account && allowQuotaFallback) {
+        const alternateHeaderStyle: HeaderStyle =
+          preferredHeaderStyle === "antigravity" ? "gemini-cli" : "antigravity";
+        account = accountManager.getCurrentOrNextForFamily(
+          family,
+          model,
+          config.account_selection_strategy,
+          alternateHeaderStyle,
+          config.pid_offset_enabled,
+          config.soft_quota_threshold_percent,
+          softQuotaCacheTtlMs,
+        );
+        if (account) {
+          pushDebug(
+            `selected-by-fallback idx=${account.index} preferred=${preferredHeaderStyle} alternate=${alternateHeaderStyle}`,
+          );
+        }
+      }
+
+      if (!account) {
+        if (accountManager.areAllAccountsOverSoftQuota(family, config.soft_quota_threshold_percent, softQuotaCacheTtlMs, model)) {
+          const threshold = config.soft_quota_threshold_percent;
+          const softQuotaWaitMs = accountManager.getMinWaitTimeForSoftQuota(family, threshold, softQuotaCacheTtlMs, model);
+          const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
+
+          if (softQuotaWaitMs === null || (maxWaitMs > 0 && softQuotaWaitMs > maxWaitMs)) {
+            const waitTimeFormatted = softQuotaWaitMs ? formatWaitTime(softQuotaWaitMs) : "unknown";
+            await showToast(
+              `All accounts over ${threshold}% quota threshold. Resets in ${waitTimeFormatted}.`,
+              "error"
+            );
+            throw new Error(
+              `Quota protection: All ${accountCount} account(s) are over ${threshold}% usage for ${family}. ` +
+              `Quota resets in ${waitTimeFormatted}. ` +
+              `Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.`
+            );
+          }
+
+          const waitSecValue = Math.max(1, Math.ceil(softQuotaWaitMs / 1000));
+          pushDebug(`all-over-soft-quota family=${family} accounts=${accountCount} waitMs=${softQuotaWaitMs}`);
+
+          if (!softQuotaToastShown) {
+            await showToast(`All ${accountCount} account(s) over ${threshold}% quota. Waiting ${formatWaitTime(softQuotaWaitMs)}...`, "warning");
+            softQuotaToastShown = true;
+          }
+
+          await sleep(softQuotaWaitMs, abortSignal);
+          continue;
+        }
+
+        const strictWait = !allowQuotaFallback;
+        // All accounts are rate-limited - wait and retry
+        const waitMs = accountManager.getMinWaitTimeForFamily(
+          family,
+          model,
+          preferredHeaderStyle,
+          strictWait,
+        ) || 60_000;
+        const waitSecValue = Math.max(1, Math.ceil(waitMs / 1000));
+
+        pushDebug(`all-rate-limited family=${family} accounts=${accountCount} waitMs=${waitMs}`);
+        if (isDebugEnabled()) {
+          logAccountContext("All accounts rate-limited", {
+            index: -1,
+            family,
+            totalAccounts: accountCount,
+          });
+          logRateLimitSnapshot(family, accountManager.getAccountsSnapshot());
+        }
+
+        // If wait time exceeds max threshold, return error immediately instead of hanging
+        // 0 means disabled (wait indefinitely)
+        const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
+        if (maxWaitMs > 0 && waitMs > maxWaitMs) {
+          const waitTimeFormatted = formatWaitTime(waitMs);
+          await showToast(
+            `Rate limited for ${waitTimeFormatted}. Try again later or add another account.`,
+            "error"
+          );
+
+          // Return a proper rate limit error response
+          throw new Error(
+            `All ${accountCount} account(s) rate-limited for ${family}. ` +
+            `Quota resets in ${waitTimeFormatted}. ` +
+            `Add more accounts with \`opencode auth login\` or wait and retry.`
+          );
+        }
+
+        if (!rateLimitToastShown) {
+          await showToast(`All ${accountCount} account(s) rate-limited for ${family}. Waiting ${waitSecValue}s...`, "warning");
+          rateLimitToastShown = true;
+        }
+
+        // Wait for the rate-limit cooldown to expire, then retry
+        await sleep(waitMs, abortSignal);
+        continue;
+      }
+
+      // Account is available - reset the toast flag
+      resetAllAccountsBlockedToasts();
+
+      pushDebug(
+        `selected idx=${account.index} email=${account.email ?? ""} family=${family} accounts=${accountCount} strategy=${config.account_selection_strategy}`,
+      );
+      if (isDebugEnabled()) {
+        logAccountContext("Selected", {
+          index: account.index,
+          email: account.email,
+          family,
+          totalAccounts: accountCount,
+          rateLimitState: account.rateLimitResetTimes,
+        });
+      }
+
+      // Show toast when switching to a different account (debounced, quiet_mode handled by showToast)
+      if (accountCount > 1 && accountManager.shouldShowAccountToast(account.index)) {
+        const accountLabel = account.email || `Account ${account.index + 1}`;
+        // Calculate position among enabled accounts (not absolute index)
+        const enabledAccounts = accountManager.getEnabledAccounts();
+        const enabledPosition = enabledAccounts.findIndex(a => a.index === account.index) + 1;
+        await showToast(
+          `Using ${accountLabel} (${enabledPosition}/${accountCount})`,
+          "info"
+        );
+        accountManager.markToastShown(account.index);
+      }
+
+      accountManager.requestSaveToDisk();
+
+      let authRecord = accountManager.toAuthDetails(account);
+
+      if (accessTokenExpired(authRecord)) {
+        try {
+          const refreshed = await refreshAccessToken(authRecord, client, providerId);
+          if (!refreshed) {
+            const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
+            getHealthTracker().recordFailure(account.index);
+            lastError = new Error("Antigravity token refresh failed");
+            if (shouldCooldown) {
+              accountManager.markAccountCoolingDown(account, cooldownMs, "auth-failure");
+              accountManager.markRateLimited(account, cooldownMs, family, "antigravity", model);
+              pushDebug(`token-refresh-failed: cooldown ${cooldownMs}ms after ${failures} failures`);
+            }
+            continue;
+          }
+          resetAccountFailureState(account.index);
+          accountManager.updateFromAuth(account, refreshed);
+          authRecord = refreshed;
+          try {
+            await accountManager.saveToDisk();
+          } catch (error) {
+            log.error("Failed to persist refreshed auth", { error: String(error) });
+          }
+        } catch (error) {
+          if (error instanceof AntigravityTokenRefreshError && error.code === "invalid_grant") {
+            const removed = accountManager.removeAccount(account);
+            if (removed) {
+              log.warn("Removed revoked account from pool - reauthenticate via `opencode auth login`");
+              try {
+                await accountManager.saveToDisk();
+              } catch (persistError) {
+                log.error("Failed to persist revoked account removal", { error: String(persistError) });
+              }
+            }
+
+            if (accountManager.getAccountCount() === 0) {
+              try {
+                await client.auth.set({
+                  path: { id: providerId },
+                  body: { type: "oauth", refresh: "", access: "", expires: 0 },
+                });
+              } catch (storeError) {
+                log.error("Failed to clear stored Antigravity OAuth credentials", { error: String(storeError) });
+              }
+
+              throw new Error(
+                "All Antigravity accounts have invalid refresh tokens. Run `opencode auth login` and reauthenticate.",
+              );
+            }
+
+            lastError = error;
+            continue;
+          }
+
+          const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
+          getHealthTracker().recordFailure(account.index);
+          lastError = error instanceof Error ? error : new Error(String(error));
+          if (shouldCooldown) {
+            accountManager.markAccountCoolingDown(account, cooldownMs, "auth-failure");
+            accountManager.markRateLimited(account, cooldownMs, family, "antigravity", model);
+            pushDebug(`token-refresh-error: cooldown ${cooldownMs}ms after ${failures} failures`);
+          }
+          continue;
+        }
+      }
+
+      const accessToken = authRecord.access;
+      if (!accessToken) {
+        lastError = new Error("Missing access token");
+        if (accountCount <= 1) {
+          throw lastError;
+        }
+        continue;
+      }
+
+      let projectContext: ProjectContextResult;
+      try {
+        projectContext = await ensureProjectContext(authRecord);
+        resetAccountFailureState(account.index);
+      } catch (error) {
+        const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
+        getHealthTracker().recordFailure(account.index);
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (shouldCooldown) {
+          accountManager.markAccountCoolingDown(account, cooldownMs, "project-error");
+          accountManager.markRateLimited(account, cooldownMs, family, "antigravity", model);
+          pushDebug(`project-context-error: cooldown ${cooldownMs}ms after ${failures} failures`);
+        }
+        continue;
+      }
+
+      if (projectContext.auth.refresh !== authRecord.refresh || 
+          projectContext.auth.access !== authRecord.access) {
+        accountManager.updateFromAuth(account, projectContext.auth);
+        authRecord = projectContext.auth;
+        try {
+          await accountManager.saveToDisk();
+        } catch (error) {
+          log.error("Failed to persist project context", { error: String(error) });
+        }
+      }
+
+      const runThinkingWarmup = async (
+        prepared: ReturnType<typeof prepareAntigravityRequest>,
+        projectId: string,
+      ): Promise<void> => {
+        if (!prepared.needsSignedThinkingWarmup || !prepared.sessionId) {
+          return;
+        }
+
+        if (!trackWarmupAttempt(prepared.sessionId)) {
+          return;
+        }
+
+        const warmupBody = buildThinkingWarmupBody(
+          typeof prepared.init.body === "string" ? prepared.init.body : undefined,
+          Boolean(prepared.effectiveModel?.toLowerCase().includes("claude") && prepared.effectiveModel?.toLowerCase().includes("thinking")),
+        );
+        if (!warmupBody) {
+          return;
+        }
+
+        const warmupUrl = toWarmupStreamUrl(prepared.request);
+        const warmupHeaders = new Headers(prepared.init.headers ?? {});
+        warmupHeaders.set("accept", "text/event-stream");
+
+        const warmupInit: RequestInit = {
+          ...prepared.init,
+          method: prepared.init.method ?? "POST",
+          headers: warmupHeaders,
+          body: warmupBody,
+        };
+
+        const warmupDebugContext = startAntigravityDebugRequest({
+          originalUrl: warmupUrl,
+          resolvedUrl: warmupUrl,
+          method: warmupInit.method,
+          headers: warmupHeaders,
+          body: warmupBody,
+          streaming: true,
+          projectId,
+        });
+
+        try {
+          pushDebug("thinking-warmup: start");
+          const warmupResponse = await fetch(warmupUrl, warmupInit);
+          const transformed = await transformAntigravityResponse(
+            warmupResponse,
+            true,
+            warmupDebugContext,
+            prepared.requestedModel,
+            projectId,
+            warmupUrl,
+            prepared.effectiveModel,
+            prepared.sessionId,
+          );
+          await transformed.text();
+          markWarmupSuccess(prepared.sessionId);
+          pushDebug("thinking-warmup: done");
+        } catch (error) {
+          clearWarmupAttempt(prepared.sessionId);
+          pushDebug(
+            `thinking-warmup: failed ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      };
+
+      // Try endpoint fallbacks with single header style based on model suffix
+      let shouldSwitchAccount = false;
+
+      // Determine header style from model suffix:
+      // - Models with antigravity- prefix -> use Antigravity quota
+      // - Gemini models without explicit prefix -> follow cli_first
+      // - Claude models -> always use Antigravity
+      let headerStyle = preferredHeaderStyle;
+      pushDebug(`headerStyle=${headerStyle} explicit=${explicitQuota}`);
+      if (account.fingerprint) {
+        pushDebug(`fingerprint: quotaUser=${account.fingerprint.quotaUser} deviceId=${account.fingerprint.deviceId.slice(0, 8)}...`);
+      }
+
+      // Check if this header style is rate-limited for this account
+      if (accountManager.isRateLimitedForHeaderStyle(account, family, headerStyle, model)) {
+        // Antigravity-first fallback: exhaust antigravity across ALL accounts before gemini-cli
+        if (allowQuotaFallback && family === "gemini" && headerStyle === "antigravity") {
+          // Check if ANY other account has antigravity available
+          if (accountManager.hasOtherAccountWithAntigravityAvailable(account.index, family, model)) {
+            // Switch to another account with antigravity (preserve antigravity priority)
+            pushDebug(`antigravity rate-limited on account ${account.index}, but available on other accounts. Switching.`);
+            shouldSwitchAccount = true;
+          } else {
+            // All accounts exhausted antigravity - fall back to gemini-cli on this account
+            const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
+            const fallbackStyle = resolveQuotaFallbackHeaderStyle({
+              family,
+              headerStyle,
+              alternateStyle,
+            });
+            if (fallbackStyle) {
+              await showToast(
+                `Antigravity quota exhausted on all accounts. Using Gemini CLI quota.`,
+                "warning"
+              );
+              headerStyle = fallbackStyle;
+              pushDebug(`all-accounts antigravity exhausted, quota fallback: ${headerStyle}`);
+            } else {
+              shouldSwitchAccount = true;
+            }
+          }
+        } else if (allowQuotaFallback && family === "gemini") {
+          // gemini-cli rate-limited - try alternate style (antigravity) on same account
+          const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
+          const fallbackStyle = resolveQuotaFallbackHeaderStyle({
+            family,
+            headerStyle,
+            alternateStyle,
+          });
+          if (fallbackStyle) {
+            const quotaName = headerStyle === "gemini-cli" ? "Gemini CLI" : "Antigravity";
+            const altQuotaName = fallbackStyle === "gemini-cli" ? "Gemini CLI" : "Antigravity";
+            await showToast(
+              `${quotaName} quota exhausted, using ${altQuotaName} quota`,
+              "warning"
+            );
+            headerStyle = fallbackStyle;
+            pushDebug(`quota fallback: ${headerStyle}`);
+          } else {
+            shouldSwitchAccount = true;
+          }
+        } else {
+          shouldSwitchAccount = true;
+        }
+      }
+
+      while (!shouldSwitchAccount) {
+
+      // Flag to force thinking recovery on retry after API error
+      let forceThinkingRecovery = false;
+
+      // Track if token was consumed (for hybrid strategy refund on error)
+      let tokenConsumed = false;
+
+      // Track capacity retries per endpoint to prevent infinite loops
+      let capacityRetryCount = 0;
+      let lastEndpointIndex = -1;
+
+      for (let i = 0; i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length; i++) {
+        // Reset capacity retry counter when switching to a new endpoint
+        if (i !== lastEndpointIndex) {
+          capacityRetryCount = 0;
+          lastEndpointIndex = i;
+        }
+
+        const currentEndpoint = ANTIGRAVITY_ENDPOINT_FALLBACKS[i];
+
+        // Skip sandbox endpoints for Gemini CLI models - they only work with Antigravity quota
+        // Gemini CLI models must use production endpoint (cloudcode-pa.googleapis.com)
+        if (headerStyle === "gemini-cli" && currentEndpoint !== ANTIGRAVITY_ENDPOINT_PROD) {
+          pushDebug(`Skipping sandbox endpoint ${currentEndpoint} for gemini-cli headerStyle`);
+          continue;
+        }
+
+        try {
+          const prepared = prepareAntigravityRequest(
+            input,
+            init,
+            accessToken,
+            projectContext.effectiveProjectId,
+            currentEndpoint,
+            headerStyle,
+            forceThinkingRecovery,
+            {
+              claudeToolHardening: config.claude_tool_hardening,
+              claudePromptAutoCaching: config.claude_prompt_auto_caching,
+              fingerprint: account.fingerprint,
+            },
+          );
+
+          const originalUrl = toUrlString(input);
+          const resolvedUrl = toUrlString(prepared.request);
+          pushDebug(`endpoint=${currentEndpoint}`);
+          pushDebug(`resolved=${resolvedUrl}`);
+          const debugContext = startAntigravityDebugRequest({
+            originalUrl,
+            resolvedUrl,
+            method: prepared.init.method,
+            headers: prepared.init.headers,
+            body: prepared.init.body,
+            streaming: prepared.streaming,
+            projectId: projectContext.effectiveProjectId,
+          });
+
+          const createFailureContext = (failureResponse: Response): FailureContext => ({
+            response: failureResponse,
+            streaming: prepared.streaming,
+            debugContext,
+            requestedModel: prepared.requestedModel,
+            projectId: prepared.projectId,
+            endpoint: prepared.endpoint,
+            effectiveModel: prepared.effectiveModel,
+            sessionId: prepared.sessionId,
+            toolDebugMissing: prepared.toolDebugMissing,
+            toolDebugSummary: prepared.toolDebugSummary,
+            toolDebugPayload: prepared.toolDebugPayload,
+          });
+
+          await runThinkingWarmup(prepared, projectContext.effectiveProjectId);
+
+          if (config.request_jitter_max_ms > 0) {
+            const jitterMs = Math.floor(Math.random() * config.request_jitter_max_ms);
+            if (jitterMs > 0) {
+              await sleep(jitterMs, abortSignal);
+            }
+          }
+
+          // Consume token for hybrid strategy
+          // Refunded later if request fails (429 or network error)
+          if (config.account_selection_strategy === 'hybrid') {
+            tokenConsumed = getTokenTracker().consume(account.index);
+          }
+
+          const response = await fetch(prepared.request, prepared.init);
+          pushDebug(`status=${response.status} ${response.statusText}`);
+
+
+
+
+          // Handle 429 rate limit (or Service Overloaded) with improved logic
+          if (response.status === 429 || response.status === 503 || response.status === 529) {
+            // Refund token on rate limit
+            if (tokenConsumed) {
+              getTokenTracker().refund(account.index);
+              tokenConsumed = false;
+            }
+
+            const defaultRetryMs = (config.default_retry_after_seconds ?? 60) * 1000;
+            const maxBackoffMs = (config.max_backoff_seconds ?? 60) * 1000;
+            const headerRetryMs = retryAfterMsFromResponse(response, defaultRetryMs);
+            const bodyInfo = await extractRetryInfoFromBody(response);
+            const serverRetryMs = bodyInfo.retryDelayMs ?? headerRetryMs;
+
+            // [Enhanced Parsing] Pass status to handling logic
+            const rateLimitReason = parseRateLimitReason(bodyInfo.reason, bodyInfo.message, response.status);
+
+            // STRATEGY 1: CAPACITY / SERVER ERROR (Transient)
+            // Goal: Wait and Retry SAME Account. DO NOT LOCK.
+            // We handle this FIRST to avoid calling getRateLimitBackoff() and polluting the global rate limit state for transient errors.
+            if (rateLimitReason === "MODEL_CAPACITY_EXHAUSTED" || rateLimitReason === "SERVER_ERROR") {
+               // Exponential backoff with jitter for capacity errors: 1s → 2s → 4s → 8s (max)
+               // Matches Antigravity-Manager's ExponentialBackoff(1s, 8s)
+               const baseDelayMs = 1000;
+               const maxDelayMs = 8000;
+               const exponentialDelay = Math.min(baseDelayMs * Math.pow(2, capacityRetryCount), maxDelayMs);
+               // Add ±10% jitter to prevent thundering herd
+               const jitter = exponentialDelay * (0.9 + Math.random() * 0.2);
+               const waitMs = Math.round(jitter);
+               const waitSec = Math.round(waitMs / 1000);
+
+               pushDebug(`Server busy (${rateLimitReason}) on account ${account.index}, exponential backoff ${waitMs}ms (attempt ${capacityRetryCount + 1})`);
+
+               await showToast(
+                 `⏳ Server busy (${response.status}). Retrying in ${waitSec}s...`,
+                 "warning",
+               );
+
+               await sleep(waitMs, abortSignal);
+
+               // CRITICAL FIX: Decrement i so that the loop 'continue' retries the SAME endpoint index
+               // (i++ in the loop will bring it back to the current index)
+               // But limit retries to prevent infinite loops (Greptile feedback)
+               if (capacityRetryCount < 3) {
+                 capacityRetryCount++;
+                 i -= 1;
+                 continue; 
+                } else {
+                  pushDebug(`Max capacity retries (3) exhausted for endpoint ${currentEndpoint}, regenerating fingerprint...`);
+                  // Regenerate fingerprint to get fresh device identity before trying next endpoint
+                  const newFingerprint = accountManager.regenerateAccountFingerprint(account.index);
+                  if (newFingerprint) {
+                    pushDebug(`Fingerprint regenerated for account ${account.index}`);
+                  }
+                  continue;
+                }
+            }
+
+            // STRATEGY 2: RATE LIMIT EXCEEDED (RPM) / QUOTA EXHAUSTED / UNKNOWN
+            // Goal: Lock and Rotate (Standard Logic)
+
+            // Only now do we call getRateLimitBackoff, which increments the global failure tracker
+            const quotaKey = headerStyleToQuotaKey(headerStyle, family);
+            const { attempt, delayMs, isDuplicate } = getRateLimitBackoff(account.index, quotaKey, serverRetryMs);
+
+            // Calculate potential backoffs
+            const smartBackoffMs = calculateBackoffMs(rateLimitReason, account.consecutiveFailures ?? 0, serverRetryMs);
+            const effectiveDelayMs = Math.max(delayMs, smartBackoffMs);
+
+            pushDebug(
+              `429 idx=${account.index} email=${account.email ?? ""} family=${family} delayMs=${effectiveDelayMs} attempt=${attempt} reason=${rateLimitReason}`,
+            );
+            if (bodyInfo.message) {
+              pushDebug(`429 message=${bodyInfo.message}`);
+            }
+            if (bodyInfo.quotaResetTime) {
+              pushDebug(`429 quotaResetTime=${bodyInfo.quotaResetTime}`);
+            }
+            if (bodyInfo.reason) {
+              pushDebug(`429 reason=${bodyInfo.reason}`);
+            }
+
+             logRateLimitEvent(
+              account.index,
+              account.email,
+              family,
+              response.status,
+              effectiveDelayMs,
+              bodyInfo,
+            );
+
+            await logResponseBody(debugContext, response, 429);
+
+            getHealthTracker().recordRateLimit(account.index);
+
+            const accountLabel = account.email || `Account ${account.index + 1}`;
+
+            // Progressive retry for standard 429s: 1st 429 → 1s then switch (if enabled) or retry same
+            if (attempt === 1 && rateLimitReason !== "QUOTA_EXHAUSTED") {
+              await showToast(`Rate limited. Quick retry in 1s...`, "warning");
+              await sleep(FIRST_RETRY_DELAY_MS, abortSignal);
+
+              // CacheFirst mode: wait for same account if within threshold (preserves prompt cache)
+              if (config.scheduling_mode === 'cache_first') {
+                const maxCacheFirstWaitMs = config.max_cache_first_wait_seconds * 1000;
+                // effectiveDelayMs is the backoff calculated for this account
+                if (effectiveDelayMs <= maxCacheFirstWaitMs) {
+                  pushDebug(`cache_first: waiting ${effectiveDelayMs}ms for same account to recover`);
+                  await showToast(`⏳ Waiting ${Math.ceil(effectiveDelayMs / 1000)}s for same account (prompt cache preserved)...`, "info");
+                  accountManager.markRateLimitedWithReason(account, family, headerStyle, model, rateLimitReason, serverRetryMs);
+                  await sleep(effectiveDelayMs, abortSignal);
+                  // Retry same endpoint after wait
+                  i -= 1;
+                  continue;
+                }
+                // Wait time exceeds threshold, fall through to switch
+                pushDebug(`cache_first: wait ${effectiveDelayMs}ms exceeds max ${maxCacheFirstWaitMs}ms, switching account`);
+              }
+
+              if (config.switch_on_first_rate_limit && accountCount > 1) {
+                accountManager.markRateLimitedWithReason(account, family, headerStyle, model, rateLimitReason, serverRetryMs, config.failure_ttl_seconds * 1000);
+                shouldSwitchAccount = true;
+                break;
+              }
+
+              // Same endpoint retry for first RPM hit
+              i -= 1; 
+              continue;
+            }
+
+            accountManager.markRateLimitedWithReason(account, family, headerStyle, model, rateLimitReason, serverRetryMs, config.failure_ttl_seconds * 1000);
+
+            accountManager.requestSaveToDisk();
+
+            // For Gemini, preserve preferred quota across accounts before fallback
+            if (family === "gemini") {
+              if (headerStyle === "antigravity") {
+                // Check if any other account has Antigravity quota for this model
+                if (hasOtherAccountWithAntigravity(account)) {
+                  pushDebug(`antigravity exhausted on account ${account.index}, but available on others. Switching account.`);
+                  await showToast(`Rate limited again. Switching account in 5s...`, "warning");
+                  await sleep(SWITCH_ACCOUNT_DELAY_MS, abortSignal);
+                  shouldSwitchAccount = true;
+                  break;
+                }
+
+                // All accounts exhausted for Antigravity on THIS model.
+                // Before falling back to gemini-cli, check if it's the last option (automatic fallback)
+                if (allowQuotaFallback) {
+                  const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
+                  const fallbackStyle = resolveQuotaFallbackHeaderStyle({
+                    family,
+                    headerStyle,
+                    alternateStyle,
+                  });
+                  if (fallbackStyle) {
+                    const safeModelName = model || "this model";
+                    await showToast(
+                      `Antigravity quota exhausted for ${safeModelName}. Switching to Gemini CLI quota...`,
+                      "warning"
+                    );
+                    headerStyle = fallbackStyle;
+                    pushDebug(`quota fallback: ${headerStyle}`);
+                    continue;
+                  }
+                }
+              } else if (headerStyle === "gemini-cli") {
+                if (allowQuotaFallback) {
+                  const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
+                  const fallbackStyle = resolveQuotaFallbackHeaderStyle({
+                    family,
+                    headerStyle,
+                    alternateStyle,
+                  });
+                  if (fallbackStyle) {
+                    const safeModelName = model || "this model";
+                    await showToast(
+                      `Gemini CLI quota exhausted for ${safeModelName}. Switching to Antigravity quota...`,
+                      "warning"
+                    );
+                    headerStyle = fallbackStyle;
+                    pushDebug(`quota fallback: ${headerStyle}`);
+                    continue;
+                  }
+                }
+              }
+            }
+
+            const quotaName = headerStyle === "antigravity" ? "Antigravity" : "Gemini CLI";
+
+            if (accountCount > 1) {
+              const quotaMsg = bodyInfo.quotaResetTime 
+                ? ` (quota resets ${bodyInfo.quotaResetTime})`
+                : ``;
+              await showToast(`Rate limited again. Switching account in 5s...${quotaMsg}`, "warning");
+              await sleep(SWITCH_ACCOUNT_DELAY_MS, abortSignal);
+            } else {
+              // Single account: exponential backoff (1s, 2s, 4s, 8s... max 60s)
+              const expBackoffMs = Math.min(FIRST_RETRY_DELAY_MS * Math.pow(2, attempt - 1), 60000);
+              const expBackoffFormatted = expBackoffMs >= 1000 ? `${Math.round(expBackoffMs / 1000)}s` : `${expBackoffMs}ms`;
+              await showToast(`Rate limited. Retrying in ${expBackoffFormatted} (attempt ${attempt})...`, "warning");
+              await sleep(expBackoffMs, abortSignal);
+            }
+
+            lastFailure = createFailureContext(response);
+            shouldSwitchAccount = true;
+            break;
+          }
+
+          // Success - reset rate limit backoff state for this quota
+          const quotaKey = headerStyleToQuotaKey(headerStyle, family);
+          resetRateLimitState(account.index, quotaKey);
+          resetAccountFailureState(account.index);
+
+          if (response.status === 403) {
+            const errorBodyText = await response.clone().text().catch(() => "");
+            const extracted = extractVerificationErrorDetails(errorBodyText);
+
+            if (extracted.validationRequired) {
+              const verificationReason = extracted.message ?? "Google requires account verification.";
+              const cooldownMs = 10 * 60 * 1000;
+
+              accountManager.markAccountVerificationRequired(account.index, verificationReason, extracted.verifyUrl);
+              accountManager.markAccountCoolingDown(account, cooldownMs, "validation-required");
+              accountManager.markRateLimited(account, cooldownMs, family, headerStyle, model);
+
+              const label = account.email || `Account ${account.index + 1}`;
+              if (accountManager.shouldShowAccountToast(account.index, 60000)) {
+                await showToast(
+                  `⚠ ${label} needs verification. Run 'opencode auth login' and use Verify accounts.`,
+                  "warning",
+                );
+                accountManager.markToastShown(account.index);
+              }
+
+              pushDebug(`verification-required: disabled account ${account.index}`);
+              getHealthTracker().recordFailure(account.index);
+
+              lastFailure = createFailureContext(response);
+              shouldSwitchAccount = true;
+              break;
+            }
+          }
+
+          const shouldRetryEndpoint = (
+            response.status === 403 ||
+            response.status === 404 ||
+            response.status >= 500
+          );
+
+          if (shouldRetryEndpoint && i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
+            await logResponseBody(debugContext, response, response.status);
+            lastFailure = createFailureContext(response);
+            continue;
+          }
+
+          // Success or non-retryable error - return the response
+          if (response.ok) {
+            account.consecutiveFailures = 0;
+            getHealthTracker().recordSuccess(account.index);
+            accountManager.markAccountUsed(account.index);
+
+            void triggerAsyncQuotaRefreshForAccount(
+              accountManager,
+              account.index,
+              client,
+              providerId,
+              config.quota_refresh_interval_minutes,
+            );
+          }
+          logAntigravityDebugResponse(debugContext, response, {
+            note: response.ok ? "Success" : `Error ${response.status}`,
+          });
+          if (response.ok && !prepared.streaming) {
+            await logResponseBody(debugContext, response, response.status);
+          }
+          if (!response.ok) {
+            await logResponseBody(debugContext, response, response.status);
+
+            // Handle 400 "Prompt too long" with synthetic response to avoid session lock
+            if (response.status === 400) {
+              const cloned = response.clone();
+              const bodyText = await cloned.text();
+              if (bodyText.includes("Prompt is too long") || bodyText.includes("prompt_too_long")) {
+                await showToast(
+                  "Context too long - use /compact to reduce size",
+                  "warning"
+                );
+                const errorMessage = `[Antigravity Error] Context is too long for this model.\n\nPlease use /compact to reduce context size, then retry your request.\n\nAlternatively, you can:\n- Use /clear to start fresh\n- Use /undo to remove recent messages\n- Switch to a model with larger context window`;
+                return createSyntheticErrorResponse(errorMessage, prepared.requestedModel);
+              }
+            }
+          }
+
+          // Empty response retry logic (ported from LLM-API-Key-Proxy)
+          // For non-streaming responses, check if the response body is empty
+          // and retry if so (up to config.empty_response_max_attempts times)
+          if (response.ok && !prepared.streaming) {
+            const maxAttempts = config.empty_response_max_attempts ?? 4;
+            const retryDelayMs = config.empty_response_retry_delay_ms ?? 2000;
+
+            // Clone to check body without consuming original
+            const clonedForCheck = response.clone();
+            const bodyText = await clonedForCheck.text();
+
+            if (isEmptyResponseBody(bodyText)) {
+              // Track empty response attempts per request
+              const emptyAttemptKey = `${prepared.sessionId ?? "none"}:${prepared.effectiveModel ?? "unknown"}`;
+              const currentAttempts = (emptyResponseAttempts.get(emptyAttemptKey) ?? 0) + 1;
+              emptyResponseAttempts.set(emptyAttemptKey, currentAttempts);
+
+              pushDebug(`empty-response: attempt ${currentAttempts}/${maxAttempts}`);
+
+              if (currentAttempts < maxAttempts) {
+                await showToast(
+                  `Empty response received. Retrying (${currentAttempts}/${maxAttempts})...`,
+                  "warning"
+                );
+                await sleep(retryDelayMs, abortSignal);
+                continue; // Retry the endpoint loop
+              }
+
+              // Clean up and throw after max attempts
+              emptyResponseAttempts.delete(emptyAttemptKey);
+              throw new EmptyResponseError(
+                "antigravity",
+                prepared.effectiveModel ?? "unknown",
+                currentAttempts,
+              );
+            }
+
+            // Clean up successful attempt tracking
+            const emptyAttemptKeyClean = `${prepared.sessionId ?? "none"}:${prepared.effectiveModel ?? "unknown"}`;
+            emptyResponseAttempts.delete(emptyAttemptKeyClean);
+          }
+
+          const transformedResponse = await transformAntigravityResponse(
+            response,
+            prepared.streaming,
+            debugContext,
+            prepared.requestedModel,
+            prepared.projectId,
+            prepared.endpoint,
+            prepared.effectiveModel,
+            prepared.sessionId,
+            prepared.toolDebugMissing,
+            prepared.toolDebugSummary,
+            prepared.toolDebugPayload,
+            debugLines,
+          );
+
+          // Check for context errors and show appropriate toast
+          const contextError = transformedResponse.headers.get("x-antigravity-context-error");
+          if (contextError) {
+            if (contextError === "prompt_too_long") {
+              await showToast(
+                "Context too long - use /compact to reduce size, or trim your request",
+                "warning"
+              );
+            } else if (contextError === "tool_pairing") {
+              await showToast(
+                "Tool call/result mismatch - use /compact to fix, or /undo last message",
+                "warning"
+              );
+            }
+          }
+
+          return transformedResponse;
+        } catch (error) {
+          // Refund token on network/API error (only if consumed)
+          if (tokenConsumed) {
+            getTokenTracker().refund(account.index);
+            tokenConsumed = false;
+          }
+
+          // Handle recoverable thinking errors - retry with forced recovery
+          if (error instanceof Error && error.message === "THINKING_RECOVERY_NEEDED") {
+            // Only retry once with forced recovery to avoid infinite loops
+            if (!forceThinkingRecovery) {
+              pushDebug("thinking-recovery: API error detected, retrying with forced recovery");
+              forceThinkingRecovery = true;
+              i = -1; // Will become 0 after loop increment, restart endpoint loop
+              continue;
+            }
+
+            // Already tried with forced recovery, give up and return error
+            const recoveryError = error as any;
+            const originalError = recoveryError.originalError || { error: { message: "Thinking recovery triggered" } };
+
+            const recoveryMessage = `${originalError.error?.message || "Session recovery failed"}\n\n[RECOVERY] Thinking block corruption could not be resolved. Try starting a new session.`;
+
+            return new Response(JSON.stringify({
+              type: "error",
+              error: {
+                type: "unrecoverable_error",
+                message: recoveryMessage
+              }
+            }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+
+          if (i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
+            lastError = error instanceof Error ? error : new Error(String(error));
+            continue;
+          }
+
+          // All endpoints failed for this account - track failure and try next account
+          const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
+          lastError = error instanceof Error ? error : new Error(String(error));
+          if (shouldCooldown) {
+            accountManager.markAccountCoolingDown(account, cooldownMs, "network-error");
+            accountManager.markRateLimited(account, cooldownMs, family, headerStyle, model);
+            pushDebug(`endpoint-error: cooldown ${cooldownMs}ms after ${failures} failures`);
+          }
+          shouldSwitchAccount = true;
+          break;
+        }
+      }
+      } // end headerStyleLoop
+
+      if (shouldSwitchAccount) {
+        // Avoid tight retry loops when there's only one account.
+        if (accountCount <= 1) {
+          if (lastFailure) {
+            return transformAntigravityResponse(
+              lastFailure.response,
+              lastFailure.streaming,
+              lastFailure.debugContext,
+              lastFailure.requestedModel,
+              lastFailure.projectId,
+              lastFailure.endpoint,
+              lastFailure.effectiveModel,
+              lastFailure.sessionId,
+              lastFailure.toolDebugMissing,
+              lastFailure.toolDebugSummary,
+              lastFailure.toolDebugPayload,
+              debugLines,
+            );
+          }
+
+          throw lastError || new Error("All Antigravity endpoints failed");
+        }
+
+        continue;
+      }
+
+      // If we get here without returning, something went wrong
+      if (lastFailure) {
+        return transformAntigravityResponse(
+          lastFailure.response,
+          lastFailure.streaming,
+          lastFailure.debugContext,
+          lastFailure.requestedModel,
+          lastFailure.projectId,
+          lastFailure.endpoint,
+          lastFailure.effectiveModel,
+          lastFailure.sessionId,
+          lastFailure.toolDebugMissing,
+          lastFailure.toolDebugSummary,
+          lastFailure.toolDebugPayload,
+          debugLines,
+        );
+      }
+
+      throw lastError || new Error("All Antigravity accounts failed");
+    }
+  };
+}
+
 export const createAntigravityPlugin = (providerId: string) => async (
   { client, directory }: PluginContext,
 ): Promise<PluginResult> => {
@@ -1451,1052 +2505,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
       return {
         apiKey: "",
-        async fetch(input, init) {
-          if (!isGenerativeLanguageRequest(input)) {
-            return fetch(input, init);
-          }
-
-          const latestAuth = await getAuth();
-          if (!isOAuthAuth(latestAuth)) {
-            return fetch(input, init);
-          }
-
-          if (accountManager.getAccountCount() === 0) {
-            throw new Error("No Antigravity accounts configured. Run `opencode auth login`.");
-          }
-
-          const urlString = toUrlString(input);
-          const family = getModelFamilyFromUrl(urlString);
-          const model = extractModelFromUrl(urlString);
-          const debugLines: string[] = [];
-          const pushDebug = (line: string) => {
-            if (!isDebugEnabled()) return;
-            debugLines.push(line);
-          };
-          pushDebug(`request=${urlString}`);
-
-          type FailureContext = {
-            response: Response;
-            streaming: boolean;
-            debugContext: ReturnType<typeof startAntigravityDebugRequest>;
-            requestedModel?: string;
-            projectId?: string;
-            endpoint?: string;
-            effectiveModel?: string;
-            sessionId?: string;
-            toolDebugMissing?: number;
-            toolDebugSummary?: string;
-            toolDebugPayload?: string;
-          };
-
-          let lastFailure: FailureContext | null = null;
-          let lastError: Error | null = null;
-          const abortSignal = init?.signal ?? undefined;
-
-          // Helper to check if request was aborted
-          const checkAborted = () => {
-            if (abortSignal?.aborted) {
-              throw abortSignal.reason instanceof Error ? abortSignal.reason : new Error("Aborted");
-            }
-          };
-
-          // Use while(true) loop to handle rate limits with backoff
-          // This ensures we wait and retry when all accounts are rate-limited
-          const quietMode = config.quiet_mode;
-          const toastScope = config.toast_scope;
-
-          // Helper to show toast without blocking on abort (respects quiet_mode and toast_scope)
-          const showToast = async (message: string, variant: "info" | "warning" | "success" | "error") => {
-            // Always log to debug regardless of toast filtering
-            log.debug("toast", { message, variant, isChildSession, toastScope });
-            
-            if (quietMode) return;
-            if (abortSignal?.aborted) return;
-            
-            // Filter toasts for child sessions when toast_scope is "root_only"
-            if (toastScope === "root_only" && isChildSession) {
-              log.debug("toast-suppressed-child-session", { message, variant, parentID: childSessionParentID });
-              return;
-            }
-            
-            if (variant === "warning" && message.toLowerCase().includes("rate")) {
-              if (!shouldShowRateLimitToast(message)) {
-                return;
-              }
-            }
-            
-            try {
-              await client.tui.showToast({
-                body: { message, variant },
-              });
-            } catch {
-              // TUI may not be available
-            }
-          };
-          
-          const hasOtherAccountWithAntigravity = (currentAccount: any): boolean => {
-            if (family !== "gemini") return false;
-            // Use AccountManager method which properly checks for disabled/cooling-down accounts
-            return accountManager.hasOtherAccountWithAntigravityAvailable(currentAccount.index, family, model);
-          };
-
-          while (true) {
-            // Check for abort at the start of each iteration
-            checkAborted();
-            
-            const accountCount = accountManager.getAccountCount();
-            const routingDecision = resolveHeaderRoutingDecision(urlString, family, config);
-            const {
-              cliFirst,
-              preferredHeaderStyle,
-              explicitQuota,
-              allowQuotaFallback,
-            } = routingDecision;
-            
-            if (accountCount === 0) {
-              throw new Error("No Antigravity accounts available. Run `opencode auth login`.");
-            }
-
-            const softQuotaCacheTtlMs = computeSoftQuotaCacheTtlMs(
-              config.soft_quota_cache_ttl_minutes,
-              config.quota_refresh_interval_minutes,
-            );
-
-            let account = accountManager.getCurrentOrNextForFamily(
-              family, 
-              model, 
-              config.account_selection_strategy,
-              preferredHeaderStyle,
-              config.pid_offset_enabled,
-              config.soft_quota_threshold_percent,
-              softQuotaCacheTtlMs,
-            );
-
-            if (!account && allowQuotaFallback) {
-              const alternateHeaderStyle: HeaderStyle =
-                preferredHeaderStyle === "antigravity" ? "gemini-cli" : "antigravity";
-              account = accountManager.getCurrentOrNextForFamily(
-                family,
-                model,
-                config.account_selection_strategy,
-                alternateHeaderStyle,
-                config.pid_offset_enabled,
-                config.soft_quota_threshold_percent,
-                softQuotaCacheTtlMs,
-              );
-              if (account) {
-                pushDebug(
-                  `selected-by-fallback idx=${account.index} preferred=${preferredHeaderStyle} alternate=${alternateHeaderStyle}`,
-                );
-              }
-            }
-            
-            if (!account) {
-              if (accountManager.areAllAccountsOverSoftQuota(family, config.soft_quota_threshold_percent, softQuotaCacheTtlMs, model)) {
-                const threshold = config.soft_quota_threshold_percent;
-                const softQuotaWaitMs = accountManager.getMinWaitTimeForSoftQuota(family, threshold, softQuotaCacheTtlMs, model);
-                const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
-                
-                if (softQuotaWaitMs === null || (maxWaitMs > 0 && softQuotaWaitMs > maxWaitMs)) {
-                  const waitTimeFormatted = softQuotaWaitMs ? formatWaitTime(softQuotaWaitMs) : "unknown";
-                  await showToast(
-                    `All accounts over ${threshold}% quota threshold. Resets in ${waitTimeFormatted}.`,
-                    "error"
-                  );
-                  throw new Error(
-                    `Quota protection: All ${accountCount} account(s) are over ${threshold}% usage for ${family}. ` +
-                    `Quota resets in ${waitTimeFormatted}. ` +
-                    `Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.`
-                  );
-                }
-                
-                const waitSecValue = Math.max(1, Math.ceil(softQuotaWaitMs / 1000));
-                pushDebug(`all-over-soft-quota family=${family} accounts=${accountCount} waitMs=${softQuotaWaitMs}`);
-                
-                if (!softQuotaToastShown) {
-                  await showToast(`All ${accountCount} account(s) over ${threshold}% quota. Waiting ${formatWaitTime(softQuotaWaitMs)}...`, "warning");
-                  softQuotaToastShown = true;
-                }
-                
-                await sleep(softQuotaWaitMs, abortSignal);
-                continue;
-              }
-
-              const strictWait = !allowQuotaFallback;
-              // All accounts are rate-limited - wait and retry
-              const waitMs = accountManager.getMinWaitTimeForFamily(
-                family,
-                model,
-                preferredHeaderStyle,
-                strictWait,
-              ) || 60_000;
-              const waitSecValue = Math.max(1, Math.ceil(waitMs / 1000));
-
-              pushDebug(`all-rate-limited family=${family} accounts=${accountCount} waitMs=${waitMs}`);
-              if (isDebugEnabled()) {
-                logAccountContext("All accounts rate-limited", {
-                  index: -1,
-                  family,
-                  totalAccounts: accountCount,
-                });
-                logRateLimitSnapshot(family, accountManager.getAccountsSnapshot());
-              }
-
-              // If wait time exceeds max threshold, return error immediately instead of hanging
-              // 0 means disabled (wait indefinitely)
-              const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
-              if (maxWaitMs > 0 && waitMs > maxWaitMs) {
-                const waitTimeFormatted = formatWaitTime(waitMs);
-                await showToast(
-                  `Rate limited for ${waitTimeFormatted}. Try again later or add another account.`,
-                  "error"
-                );
-                
-                // Return a proper rate limit error response
-                throw new Error(
-                  `All ${accountCount} account(s) rate-limited for ${family}. ` +
-                  `Quota resets in ${waitTimeFormatted}. ` +
-                  `Add more accounts with \`opencode auth login\` or wait and retry.`
-                );
-              }
-
-              if (!rateLimitToastShown) {
-                await showToast(`All ${accountCount} account(s) rate-limited for ${family}. Waiting ${waitSecValue}s...`, "warning");
-                rateLimitToastShown = true;
-              }
-
-              // Wait for the rate-limit cooldown to expire, then retry
-              await sleep(waitMs, abortSignal);
-              continue;
-            }
-
-            // Account is available - reset the toast flag
-            resetAllAccountsBlockedToasts();
-
-            pushDebug(
-              `selected idx=${account.index} email=${account.email ?? ""} family=${family} accounts=${accountCount} strategy=${config.account_selection_strategy}`,
-            );
-            if (isDebugEnabled()) {
-              logAccountContext("Selected", {
-                index: account.index,
-                email: account.email,
-                family,
-                totalAccounts: accountCount,
-                rateLimitState: account.rateLimitResetTimes,
-              });
-            }
-
-            // Show toast when switching to a different account (debounced, quiet_mode handled by showToast)
-            if (accountCount > 1 && accountManager.shouldShowAccountToast(account.index)) {
-              const accountLabel = account.email || `Account ${account.index + 1}`;
-              // Calculate position among enabled accounts (not absolute index)
-              const enabledAccounts = accountManager.getEnabledAccounts();
-              const enabledPosition = enabledAccounts.findIndex(a => a.index === account.index) + 1;
-              await showToast(
-                `Using ${accountLabel} (${enabledPosition}/${accountCount})`,
-                "info"
-              );
-              accountManager.markToastShown(account.index);
-            }
-
-            accountManager.requestSaveToDisk();
-
-            let authRecord = accountManager.toAuthDetails(account);
-
-            if (accessTokenExpired(authRecord)) {
-              try {
-                const refreshed = await refreshAccessToken(authRecord, client, providerId);
-                if (!refreshed) {
-                  const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
-                  getHealthTracker().recordFailure(account.index);
-                  lastError = new Error("Antigravity token refresh failed");
-                  if (shouldCooldown) {
-                    accountManager.markAccountCoolingDown(account, cooldownMs, "auth-failure");
-                    accountManager.markRateLimited(account, cooldownMs, family, "antigravity", model);
-                    pushDebug(`token-refresh-failed: cooldown ${cooldownMs}ms after ${failures} failures`);
-                  }
-                  continue;
-                }
-                resetAccountFailureState(account.index);
-                accountManager.updateFromAuth(account, refreshed);
-                authRecord = refreshed;
-                try {
-                  await accountManager.saveToDisk();
-                } catch (error) {
-                  log.error("Failed to persist refreshed auth", { error: String(error) });
-                }
-              } catch (error) {
-                if (error instanceof AntigravityTokenRefreshError && error.code === "invalid_grant") {
-                  const removed = accountManager.removeAccount(account);
-                  if (removed) {
-                    log.warn("Removed revoked account from pool - reauthenticate via `opencode auth login`");
-                    try {
-                      await accountManager.saveToDisk();
-                    } catch (persistError) {
-                      log.error("Failed to persist revoked account removal", { error: String(persistError) });
-                    }
-                  }
-
-                  if (accountManager.getAccountCount() === 0) {
-                    try {
-                      await client.auth.set({
-                        path: { id: providerId },
-                        body: { type: "oauth", refresh: "", access: "", expires: 0 },
-                      });
-                    } catch (storeError) {
-                      log.error("Failed to clear stored Antigravity OAuth credentials", { error: String(storeError) });
-                    }
-
-                    throw new Error(
-                      "All Antigravity accounts have invalid refresh tokens. Run `opencode auth login` and reauthenticate.",
-                    );
-                  }
-
-                  lastError = error;
-                  continue;
-                }
-
-                const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
-                getHealthTracker().recordFailure(account.index);
-                lastError = error instanceof Error ? error : new Error(String(error));
-                if (shouldCooldown) {
-                  accountManager.markAccountCoolingDown(account, cooldownMs, "auth-failure");
-                  accountManager.markRateLimited(account, cooldownMs, family, "antigravity", model);
-                  pushDebug(`token-refresh-error: cooldown ${cooldownMs}ms after ${failures} failures`);
-                }
-                continue;
-              }
-            }
-
-            const accessToken = authRecord.access;
-            if (!accessToken) {
-              lastError = new Error("Missing access token");
-              if (accountCount <= 1) {
-                throw lastError;
-              }
-              continue;
-            }
-
-            let projectContext: ProjectContextResult;
-            try {
-              projectContext = await ensureProjectContext(authRecord);
-              resetAccountFailureState(account.index);
-            } catch (error) {
-              const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
-              getHealthTracker().recordFailure(account.index);
-              lastError = error instanceof Error ? error : new Error(String(error));
-              if (shouldCooldown) {
-                accountManager.markAccountCoolingDown(account, cooldownMs, "project-error");
-                accountManager.markRateLimited(account, cooldownMs, family, "antigravity", model);
-                pushDebug(`project-context-error: cooldown ${cooldownMs}ms after ${failures} failures`);
-              }
-              continue;
-            }
-
-            if (projectContext.auth.refresh !== authRecord.refresh || 
-                projectContext.auth.access !== authRecord.access) {
-              accountManager.updateFromAuth(account, projectContext.auth);
-              authRecord = projectContext.auth;
-              try {
-                await accountManager.saveToDisk();
-              } catch (error) {
-                log.error("Failed to persist project context", { error: String(error) });
-              }
-            }
-
-            const runThinkingWarmup = async (
-              prepared: ReturnType<typeof prepareAntigravityRequest>,
-              projectId: string,
-            ): Promise<void> => {
-              if (!prepared.needsSignedThinkingWarmup || !prepared.sessionId) {
-                return;
-              }
-
-              if (!trackWarmupAttempt(prepared.sessionId)) {
-                return;
-              }
-
-              const warmupBody = buildThinkingWarmupBody(
-                typeof prepared.init.body === "string" ? prepared.init.body : undefined,
-                Boolean(prepared.effectiveModel?.toLowerCase().includes("claude") && prepared.effectiveModel?.toLowerCase().includes("thinking")),
-              );
-              if (!warmupBody) {
-                return;
-              }
-
-              const warmupUrl = toWarmupStreamUrl(prepared.request);
-              const warmupHeaders = new Headers(prepared.init.headers ?? {});
-              warmupHeaders.set("accept", "text/event-stream");
-
-              const warmupInit: RequestInit = {
-                ...prepared.init,
-                method: prepared.init.method ?? "POST",
-                headers: warmupHeaders,
-                body: warmupBody,
-              };
-
-              const warmupDebugContext = startAntigravityDebugRequest({
-                originalUrl: warmupUrl,
-                resolvedUrl: warmupUrl,
-                method: warmupInit.method,
-                headers: warmupHeaders,
-                body: warmupBody,
-                streaming: true,
-                projectId,
-              });
-
-              try {
-                pushDebug("thinking-warmup: start");
-                const warmupResponse = await fetch(warmupUrl, warmupInit);
-                const transformed = await transformAntigravityResponse(
-                  warmupResponse,
-                  true,
-                  warmupDebugContext,
-                  prepared.requestedModel,
-                  projectId,
-                  warmupUrl,
-                  prepared.effectiveModel,
-                  prepared.sessionId,
-                );
-                await transformed.text();
-                markWarmupSuccess(prepared.sessionId);
-                pushDebug("thinking-warmup: done");
-              } catch (error) {
-                clearWarmupAttempt(prepared.sessionId);
-                pushDebug(
-                  `thinking-warmup: failed ${error instanceof Error ? error.message : String(error)}`,
-                );
-              }
-            };
-
-            // Try endpoint fallbacks with single header style based on model suffix
-            let shouldSwitchAccount = false;
-            
-            // Determine header style from model suffix:
-            // - Models with antigravity- prefix -> use Antigravity quota
-            // - Gemini models without explicit prefix -> follow cli_first
-            // - Claude models -> always use Antigravity
-            let headerStyle = preferredHeaderStyle;
-            pushDebug(`headerStyle=${headerStyle} explicit=${explicitQuota}`);
-            if (account.fingerprint) {
-              pushDebug(`fingerprint: quotaUser=${account.fingerprint.quotaUser} deviceId=${account.fingerprint.deviceId.slice(0, 8)}...`);
-            }
-            
-            // Check if this header style is rate-limited for this account
-            if (accountManager.isRateLimitedForHeaderStyle(account, family, headerStyle, model)) {
-              // Antigravity-first fallback: exhaust antigravity across ALL accounts before gemini-cli
-              if (allowQuotaFallback && family === "gemini" && headerStyle === "antigravity") {
-                // Check if ANY other account has antigravity available
-                if (accountManager.hasOtherAccountWithAntigravityAvailable(account.index, family, model)) {
-                  // Switch to another account with antigravity (preserve antigravity priority)
-                  pushDebug(`antigravity rate-limited on account ${account.index}, but available on other accounts. Switching.`);
-                  shouldSwitchAccount = true;
-                } else {
-                  // All accounts exhausted antigravity - fall back to gemini-cli on this account
-                  const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
-                  const fallbackStyle = resolveQuotaFallbackHeaderStyle({
-                    family,
-                    headerStyle,
-                    alternateStyle,
-                  });
-                  if (fallbackStyle) {
-                    await showToast(
-                      `Antigravity quota exhausted on all accounts. Using Gemini CLI quota.`,
-                      "warning"
-                    );
-                    headerStyle = fallbackStyle;
-                    pushDebug(`all-accounts antigravity exhausted, quota fallback: ${headerStyle}`);
-                  } else {
-                    shouldSwitchAccount = true;
-                  }
-                }
-              } else if (allowQuotaFallback && family === "gemini") {
-                // gemini-cli rate-limited - try alternate style (antigravity) on same account
-                const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
-                const fallbackStyle = resolveQuotaFallbackHeaderStyle({
-                  family,
-                  headerStyle,
-                  alternateStyle,
-                });
-                if (fallbackStyle) {
-                  const quotaName = headerStyle === "gemini-cli" ? "Gemini CLI" : "Antigravity";
-                  const altQuotaName = fallbackStyle === "gemini-cli" ? "Gemini CLI" : "Antigravity";
-                  await showToast(
-                    `${quotaName} quota exhausted, using ${altQuotaName} quota`,
-                    "warning"
-                  );
-                  headerStyle = fallbackStyle;
-                  pushDebug(`quota fallback: ${headerStyle}`);
-                } else {
-                  shouldSwitchAccount = true;
-                }
-              } else {
-                shouldSwitchAccount = true;
-              }
-            }
-            
-            while (!shouldSwitchAccount) {
-            
-            // Flag to force thinking recovery on retry after API error
-            let forceThinkingRecovery = false;
-            
-            // Track if token was consumed (for hybrid strategy refund on error)
-            let tokenConsumed = false;
-            
-            // Track capacity retries per endpoint to prevent infinite loops
-            let capacityRetryCount = 0;
-            let lastEndpointIndex = -1;
-            
-            for (let i = 0; i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length; i++) {
-              // Reset capacity retry counter when switching to a new endpoint
-              if (i !== lastEndpointIndex) {
-                capacityRetryCount = 0;
-                lastEndpointIndex = i;
-              }
-
-              const currentEndpoint = ANTIGRAVITY_ENDPOINT_FALLBACKS[i];
-
-              // Skip sandbox endpoints for Gemini CLI models - they only work with Antigravity quota
-              // Gemini CLI models must use production endpoint (cloudcode-pa.googleapis.com)
-              if (headerStyle === "gemini-cli" && currentEndpoint !== ANTIGRAVITY_ENDPOINT_PROD) {
-                pushDebug(`Skipping sandbox endpoint ${currentEndpoint} for gemini-cli headerStyle`);
-                continue;
-              }
-
-              try {
-                const prepared = prepareAntigravityRequest(
-                  input,
-                  init,
-                  accessToken,
-                  projectContext.effectiveProjectId,
-                  currentEndpoint,
-                  headerStyle,
-                  forceThinkingRecovery,
-                  {
-                    claudeToolHardening: config.claude_tool_hardening,
-                    claudePromptAutoCaching: config.claude_prompt_auto_caching,
-                    fingerprint: account.fingerprint,
-                  },
-                );
-
-                const originalUrl = toUrlString(input);
-                const resolvedUrl = toUrlString(prepared.request);
-                pushDebug(`endpoint=${currentEndpoint}`);
-                pushDebug(`resolved=${resolvedUrl}`);
-                const debugContext = startAntigravityDebugRequest({
-                  originalUrl,
-                  resolvedUrl,
-                  method: prepared.init.method,
-                  headers: prepared.init.headers,
-                  body: prepared.init.body,
-                  streaming: prepared.streaming,
-                  projectId: projectContext.effectiveProjectId,
-                });
-
-                const createFailureContext = (failureResponse: Response): FailureContext => ({
-                  response: failureResponse,
-                  streaming: prepared.streaming,
-                  debugContext,
-                  requestedModel: prepared.requestedModel,
-                  projectId: prepared.projectId,
-                  endpoint: prepared.endpoint,
-                  effectiveModel: prepared.effectiveModel,
-                  sessionId: prepared.sessionId,
-                  toolDebugMissing: prepared.toolDebugMissing,
-                  toolDebugSummary: prepared.toolDebugSummary,
-                  toolDebugPayload: prepared.toolDebugPayload,
-                });
-
-                await runThinkingWarmup(prepared, projectContext.effectiveProjectId);
-
-                if (config.request_jitter_max_ms > 0) {
-                  const jitterMs = Math.floor(Math.random() * config.request_jitter_max_ms);
-                  if (jitterMs > 0) {
-                    await sleep(jitterMs, abortSignal);
-                  }
-                }
-
-                // Consume token for hybrid strategy
-                // Refunded later if request fails (429 or network error)
-                if (config.account_selection_strategy === 'hybrid') {
-                  tokenConsumed = getTokenTracker().consume(account.index);
-                }
-
-                const response = await fetch(prepared.request, prepared.init);
-                pushDebug(`status=${response.status} ${response.statusText}`);
-
-
-
-
-                // Handle 429 rate limit (or Service Overloaded) with improved logic
-                if (response.status === 429 || response.status === 503 || response.status === 529) {
-                  // Refund token on rate limit
-                  if (tokenConsumed) {
-                    getTokenTracker().refund(account.index);
-                    tokenConsumed = false;
-                  }
-
-                  const defaultRetryMs = (config.default_retry_after_seconds ?? 60) * 1000;
-                  const maxBackoffMs = (config.max_backoff_seconds ?? 60) * 1000;
-                  const headerRetryMs = retryAfterMsFromResponse(response, defaultRetryMs);
-                  const bodyInfo = await extractRetryInfoFromBody(response);
-                  const serverRetryMs = bodyInfo.retryDelayMs ?? headerRetryMs;
-
-                  // [Enhanced Parsing] Pass status to handling logic
-                  const rateLimitReason = parseRateLimitReason(bodyInfo.reason, bodyInfo.message, response.status);
-
-                  // STRATEGY 1: CAPACITY / SERVER ERROR (Transient)
-                  // Goal: Wait and Retry SAME Account. DO NOT LOCK.
-                  // We handle this FIRST to avoid calling getRateLimitBackoff() and polluting the global rate limit state for transient errors.
-                  if (rateLimitReason === "MODEL_CAPACITY_EXHAUSTED" || rateLimitReason === "SERVER_ERROR") {
-                     // Exponential backoff with jitter for capacity errors: 1s → 2s → 4s → 8s (max)
-                     // Matches Antigravity-Manager's ExponentialBackoff(1s, 8s)
-                     const baseDelayMs = 1000;
-                     const maxDelayMs = 8000;
-                     const exponentialDelay = Math.min(baseDelayMs * Math.pow(2, capacityRetryCount), maxDelayMs);
-                     // Add ±10% jitter to prevent thundering herd
-                     const jitter = exponentialDelay * (0.9 + Math.random() * 0.2);
-                     const waitMs = Math.round(jitter);
-                     const waitSec = Math.round(waitMs / 1000);
-                     
-                     pushDebug(`Server busy (${rateLimitReason}) on account ${account.index}, exponential backoff ${waitMs}ms (attempt ${capacityRetryCount + 1})`);
-
-                     await showToast(
-                       `⏳ Server busy (${response.status}). Retrying in ${waitSec}s...`,
-                       "warning",
-                     );
-                     
-                     await sleep(waitMs, abortSignal);
-                     
-                     // CRITICAL FIX: Decrement i so that the loop 'continue' retries the SAME endpoint index
-                     // (i++ in the loop will bring it back to the current index)
-                     // But limit retries to prevent infinite loops (Greptile feedback)
-                     if (capacityRetryCount < 3) {
-                       capacityRetryCount++;
-                       i -= 1;
-                       continue; 
-                      } else {
-                        pushDebug(`Max capacity retries (3) exhausted for endpoint ${currentEndpoint}, regenerating fingerprint...`);
-                        // Regenerate fingerprint to get fresh device identity before trying next endpoint
-                        const newFingerprint = accountManager.regenerateAccountFingerprint(account.index);
-                        if (newFingerprint) {
-                          pushDebug(`Fingerprint regenerated for account ${account.index}`);
-                        }
-                        continue;
-                      }
-                  }
-
-                  // STRATEGY 2: RATE LIMIT EXCEEDED (RPM) / QUOTA EXHAUSTED / UNKNOWN
-                  // Goal: Lock and Rotate (Standard Logic)
-                  
-                  // Only now do we call getRateLimitBackoff, which increments the global failure tracker
-                  const quotaKey = headerStyleToQuotaKey(headerStyle, family);
-                  const { attempt, delayMs, isDuplicate } = getRateLimitBackoff(account.index, quotaKey, serverRetryMs);
-                  
-                  // Calculate potential backoffs
-                  const smartBackoffMs = calculateBackoffMs(rateLimitReason, account.consecutiveFailures ?? 0, serverRetryMs);
-                  const effectiveDelayMs = Math.max(delayMs, smartBackoffMs);
-
-                  pushDebug(
-                    `429 idx=${account.index} email=${account.email ?? ""} family=${family} delayMs=${effectiveDelayMs} attempt=${attempt} reason=${rateLimitReason}`,
-                  );
-                  if (bodyInfo.message) {
-                    pushDebug(`429 message=${bodyInfo.message}`);
-                  }
-                  if (bodyInfo.quotaResetTime) {
-                    pushDebug(`429 quotaResetTime=${bodyInfo.quotaResetTime}`);
-                  }
-                  if (bodyInfo.reason) {
-                    pushDebug(`429 reason=${bodyInfo.reason}`);
-                  }
-
-                   logRateLimitEvent(
-                    account.index,
-                    account.email,
-                    family,
-                    response.status,
-                    effectiveDelayMs,
-                    bodyInfo,
-                  );
-
-                  await logResponseBody(debugContext, response, 429);
-
-                  getHealthTracker().recordRateLimit(account.index);
-
-                  const accountLabel = account.email || `Account ${account.index + 1}`;
-
-                  // Progressive retry for standard 429s: 1st 429 → 1s then switch (if enabled) or retry same
-                  if (attempt === 1 && rateLimitReason !== "QUOTA_EXHAUSTED") {
-                    await showToast(`Rate limited. Quick retry in 1s...`, "warning");
-                    await sleep(FIRST_RETRY_DELAY_MS, abortSignal);
-                    
-                    // CacheFirst mode: wait for same account if within threshold (preserves prompt cache)
-                    if (config.scheduling_mode === 'cache_first') {
-                      const maxCacheFirstWaitMs = config.max_cache_first_wait_seconds * 1000;
-                      // effectiveDelayMs is the backoff calculated for this account
-                      if (effectiveDelayMs <= maxCacheFirstWaitMs) {
-                        pushDebug(`cache_first: waiting ${effectiveDelayMs}ms for same account to recover`);
-                        await showToast(`⏳ Waiting ${Math.ceil(effectiveDelayMs / 1000)}s for same account (prompt cache preserved)...`, "info");
-                        accountManager.markRateLimitedWithReason(account, family, headerStyle, model, rateLimitReason, serverRetryMs);
-                        await sleep(effectiveDelayMs, abortSignal);
-                        // Retry same endpoint after wait
-                        i -= 1;
-                        continue;
-                      }
-                      // Wait time exceeds threshold, fall through to switch
-                      pushDebug(`cache_first: wait ${effectiveDelayMs}ms exceeds max ${maxCacheFirstWaitMs}ms, switching account`);
-                    }
-                    
-                    if (config.switch_on_first_rate_limit && accountCount > 1) {
-                      accountManager.markRateLimitedWithReason(account, family, headerStyle, model, rateLimitReason, serverRetryMs, config.failure_ttl_seconds * 1000);
-                      shouldSwitchAccount = true;
-                      break;
-                    }
-                    
-                    // Same endpoint retry for first RPM hit
-                    i -= 1; 
-                    continue;
-                  }
-
-                  accountManager.markRateLimitedWithReason(account, family, headerStyle, model, rateLimitReason, serverRetryMs, config.failure_ttl_seconds * 1000);
-
-                  accountManager.requestSaveToDisk();
-
-                  // For Gemini, preserve preferred quota across accounts before fallback
-                  if (family === "gemini") {
-                    if (headerStyle === "antigravity") {
-                      // Check if any other account has Antigravity quota for this model
-                      if (hasOtherAccountWithAntigravity(account)) {
-                        pushDebug(`antigravity exhausted on account ${account.index}, but available on others. Switching account.`);
-                        await showToast(`Rate limited again. Switching account in 5s...`, "warning");
-                        await sleep(SWITCH_ACCOUNT_DELAY_MS, abortSignal);
-                        shouldSwitchAccount = true;
-                        break;
-                      }
-
-                      // All accounts exhausted for Antigravity on THIS model.
-                      // Before falling back to gemini-cli, check if it's the last option (automatic fallback)
-                      if (allowQuotaFallback) {
-                        const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
-                        const fallbackStyle = resolveQuotaFallbackHeaderStyle({
-                          family,
-                          headerStyle,
-                          alternateStyle,
-                        });
-                        if (fallbackStyle) {
-                          const safeModelName = model || "this model";
-                          await showToast(
-                            `Antigravity quota exhausted for ${safeModelName}. Switching to Gemini CLI quota...`,
-                            "warning"
-                          );
-                          headerStyle = fallbackStyle;
-                          pushDebug(`quota fallback: ${headerStyle}`);
-                          continue;
-                        }
-                      }
-                    } else if (headerStyle === "gemini-cli") {
-                      if (allowQuotaFallback) {
-                        const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
-                        const fallbackStyle = resolveQuotaFallbackHeaderStyle({
-                          family,
-                          headerStyle,
-                          alternateStyle,
-                        });
-                        if (fallbackStyle) {
-                          const safeModelName = model || "this model";
-                          await showToast(
-                            `Gemini CLI quota exhausted for ${safeModelName}. Switching to Antigravity quota...`,
-                            "warning"
-                          );
-                          headerStyle = fallbackStyle;
-                          pushDebug(`quota fallback: ${headerStyle}`);
-                          continue;
-                        }
-                      }
-                    }
-                  }
-
-                  const quotaName = headerStyle === "antigravity" ? "Antigravity" : "Gemini CLI";
-
-                  if (accountCount > 1) {
-                    const quotaMsg = bodyInfo.quotaResetTime 
-                      ? ` (quota resets ${bodyInfo.quotaResetTime})`
-                      : ``;
-                    await showToast(`Rate limited again. Switching account in 5s...${quotaMsg}`, "warning");
-                    await sleep(SWITCH_ACCOUNT_DELAY_MS, abortSignal);
-                  } else {
-                    // Single account: exponential backoff (1s, 2s, 4s, 8s... max 60s)
-                    const expBackoffMs = Math.min(FIRST_RETRY_DELAY_MS * Math.pow(2, attempt - 1), 60000);
-                    const expBackoffFormatted = expBackoffMs >= 1000 ? `${Math.round(expBackoffMs / 1000)}s` : `${expBackoffMs}ms`;
-                    await showToast(`Rate limited. Retrying in ${expBackoffFormatted} (attempt ${attempt})...`, "warning");
-                    await sleep(expBackoffMs, abortSignal);
-                  }
-
-                  lastFailure = createFailureContext(response);
-                  shouldSwitchAccount = true;
-                  break;
-                }
-
-                // Success - reset rate limit backoff state for this quota
-                const quotaKey = headerStyleToQuotaKey(headerStyle, family);
-                resetRateLimitState(account.index, quotaKey);
-                resetAccountFailureState(account.index);
-
-                if (response.status === 403) {
-                  const errorBodyText = await response.clone().text().catch(() => "");
-                  const extracted = extractVerificationErrorDetails(errorBodyText);
-
-                  if (extracted.validationRequired) {
-                    const verificationReason = extracted.message ?? "Google requires account verification.";
-                    const cooldownMs = 10 * 60 * 1000;
-
-                    accountManager.markAccountVerificationRequired(account.index, verificationReason, extracted.verifyUrl);
-                    accountManager.markAccountCoolingDown(account, cooldownMs, "validation-required");
-                    accountManager.markRateLimited(account, cooldownMs, family, headerStyle, model);
-
-                    const label = account.email || `Account ${account.index + 1}`;
-                    if (accountManager.shouldShowAccountToast(account.index, 60000)) {
-                      await showToast(
-                        `⚠ ${label} needs verification. Run 'opencode auth login' and use Verify accounts.`,
-                        "warning",
-                      );
-                      accountManager.markToastShown(account.index);
-                    }
-
-                    pushDebug(`verification-required: disabled account ${account.index}`);
-                    getHealthTracker().recordFailure(account.index);
-
-                    lastFailure = createFailureContext(response);
-                    shouldSwitchAccount = true;
-                    break;
-                  }
-                }
-
-                const shouldRetryEndpoint = (
-                  response.status === 403 ||
-                  response.status === 404 ||
-                  response.status >= 500
-                );
-
-                if (shouldRetryEndpoint && i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
-                  await logResponseBody(debugContext, response, response.status);
-                  lastFailure = createFailureContext(response);
-                  continue;
-                }
-
-                // Success or non-retryable error - return the response
-                if (response.ok) {
-                  account.consecutiveFailures = 0;
-                  getHealthTracker().recordSuccess(account.index);
-                  accountManager.markAccountUsed(account.index);
-                  
-                  void triggerAsyncQuotaRefreshForAccount(
-                    accountManager,
-                    account.index,
-                    client,
-                    providerId,
-                    config.quota_refresh_interval_minutes,
-                  );
-                }
-                logAntigravityDebugResponse(debugContext, response, {
-                  note: response.ok ? "Success" : `Error ${response.status}`,
-                });
-                if (response.ok && !prepared.streaming) {
-                  await logResponseBody(debugContext, response, response.status);
-                }
-                if (!response.ok) {
-                  await logResponseBody(debugContext, response, response.status);
-                  
-                  // Handle 400 "Prompt too long" with synthetic response to avoid session lock
-                  if (response.status === 400) {
-                    const cloned = response.clone();
-                    const bodyText = await cloned.text();
-                    if (bodyText.includes("Prompt is too long") || bodyText.includes("prompt_too_long")) {
-                      await showToast(
-                        "Context too long - use /compact to reduce size",
-                        "warning"
-                      );
-                      const errorMessage = `[Antigravity Error] Context is too long for this model.\n\nPlease use /compact to reduce context size, then retry your request.\n\nAlternatively, you can:\n- Use /clear to start fresh\n- Use /undo to remove recent messages\n- Switch to a model with larger context window`;
-                      return createSyntheticErrorResponse(errorMessage, prepared.requestedModel);
-                    }
-                  }
-                }
-                
-                // Empty response retry logic (ported from LLM-API-Key-Proxy)
-                // For non-streaming responses, check if the response body is empty
-                // and retry if so (up to config.empty_response_max_attempts times)
-                if (response.ok && !prepared.streaming) {
-                  const maxAttempts = config.empty_response_max_attempts ?? 4;
-                  const retryDelayMs = config.empty_response_retry_delay_ms ?? 2000;
-                  
-                  // Clone to check body without consuming original
-                  const clonedForCheck = response.clone();
-                  const bodyText = await clonedForCheck.text();
-                  
-                  if (isEmptyResponseBody(bodyText)) {
-                    // Track empty response attempts per request
-                    const emptyAttemptKey = `${prepared.sessionId ?? "none"}:${prepared.effectiveModel ?? "unknown"}`;
-                    const currentAttempts = (emptyResponseAttempts.get(emptyAttemptKey) ?? 0) + 1;
-                    emptyResponseAttempts.set(emptyAttemptKey, currentAttempts);
-                    
-                    pushDebug(`empty-response: attempt ${currentAttempts}/${maxAttempts}`);
-                    
-                    if (currentAttempts < maxAttempts) {
-                      await showToast(
-                        `Empty response received. Retrying (${currentAttempts}/${maxAttempts})...`,
-                        "warning"
-                      );
-                      await sleep(retryDelayMs, abortSignal);
-                      continue; // Retry the endpoint loop
-                    }
-                    
-                    // Clean up and throw after max attempts
-                    emptyResponseAttempts.delete(emptyAttemptKey);
-                    throw new EmptyResponseError(
-                      "antigravity",
-                      prepared.effectiveModel ?? "unknown",
-                      currentAttempts,
-                    );
-                  }
-                  
-                  // Clean up successful attempt tracking
-                  const emptyAttemptKeyClean = `${prepared.sessionId ?? "none"}:${prepared.effectiveModel ?? "unknown"}`;
-                  emptyResponseAttempts.delete(emptyAttemptKeyClean);
-                }
-                
-                const transformedResponse = await transformAntigravityResponse(
-                  response,
-                  prepared.streaming,
-                  debugContext,
-                  prepared.requestedModel,
-                  prepared.projectId,
-                  prepared.endpoint,
-                  prepared.effectiveModel,
-                  prepared.sessionId,
-                  prepared.toolDebugMissing,
-                  prepared.toolDebugSummary,
-                  prepared.toolDebugPayload,
-                  debugLines,
-                );
-
-                // Check for context errors and show appropriate toast
-                const contextError = transformedResponse.headers.get("x-antigravity-context-error");
-                if (contextError) {
-                  if (contextError === "prompt_too_long") {
-                    await showToast(
-                      "Context too long - use /compact to reduce size, or trim your request",
-                      "warning"
-                    );
-                  } else if (contextError === "tool_pairing") {
-                    await showToast(
-                      "Tool call/result mismatch - use /compact to fix, or /undo last message",
-                      "warning"
-                    );
-                  }
-                }
-
-                return transformedResponse;
-              } catch (error) {
-                // Refund token on network/API error (only if consumed)
-                if (tokenConsumed) {
-                  getTokenTracker().refund(account.index);
-                  tokenConsumed = false;
-                }
-
-                // Handle recoverable thinking errors - retry with forced recovery
-                if (error instanceof Error && error.message === "THINKING_RECOVERY_NEEDED") {
-                  // Only retry once with forced recovery to avoid infinite loops
-                  if (!forceThinkingRecovery) {
-                    pushDebug("thinking-recovery: API error detected, retrying with forced recovery");
-                    forceThinkingRecovery = true;
-                    i = -1; // Will become 0 after loop increment, restart endpoint loop
-                    continue;
-                  }
-                  
-                  // Already tried with forced recovery, give up and return error
-                  const recoveryError = error as any;
-                  const originalError = recoveryError.originalError || { error: { message: "Thinking recovery triggered" } };
-                  
-                  const recoveryMessage = `${originalError.error?.message || "Session recovery failed"}\n\n[RECOVERY] Thinking block corruption could not be resolved. Try starting a new session.`;
-                  
-                  return new Response(JSON.stringify({
-                    type: "error",
-                    error: {
-                      type: "unrecoverable_error",
-                      message: recoveryMessage
-                    }
-                  }), {
-                    status: 400,
-                    headers: { "Content-Type": "application/json" }
-                  });
-                }
-
-                if (i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
-                  lastError = error instanceof Error ? error : new Error(String(error));
-                  continue;
-                }
-
-                // All endpoints failed for this account - track failure and try next account
-                const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
-                lastError = error instanceof Error ? error : new Error(String(error));
-                if (shouldCooldown) {
-                  accountManager.markAccountCoolingDown(account, cooldownMs, "network-error");
-                  accountManager.markRateLimited(account, cooldownMs, family, headerStyle, model);
-                  pushDebug(`endpoint-error: cooldown ${cooldownMs}ms after ${failures} failures`);
-                }
-                shouldSwitchAccount = true;
-                break;
-              }
-            }
-            } // end headerStyleLoop
-            
-            if (shouldSwitchAccount) {
-              // Avoid tight retry loops when there's only one account.
-              if (accountCount <= 1) {
-                if (lastFailure) {
-                  return transformAntigravityResponse(
-                    lastFailure.response,
-                    lastFailure.streaming,
-                    lastFailure.debugContext,
-                    lastFailure.requestedModel,
-                    lastFailure.projectId,
-                    lastFailure.endpoint,
-                    lastFailure.effectiveModel,
-                    lastFailure.sessionId,
-                    lastFailure.toolDebugMissing,
-                    lastFailure.toolDebugSummary,
-                    lastFailure.toolDebugPayload,
-                    debugLines,
-                  );
-                }
-
-                throw lastError || new Error("All Antigravity endpoints failed");
-              }
-
-              continue;
-            }
-
-            // If we get here without returning, something went wrong
-            if (lastFailure) {
-              return transformAntigravityResponse(
-                lastFailure.response,
-                lastFailure.streaming,
-                lastFailure.debugContext,
-                lastFailure.requestedModel,
-                lastFailure.projectId,
-                lastFailure.endpoint,
-                lastFailure.effectiveModel,
-                lastFailure.sessionId,
-                lastFailure.toolDebugMissing,
-                lastFailure.toolDebugSummary,
-                lastFailure.toolDebugPayload,
-                debugLines,
-              );
-            }
-
-            throw lastError || new Error("All Antigravity accounts failed");
-          }
-        },
+        fetch: createAntigravityFetch({ getAuth, accountManager, client, config, providerId }),
       };
     },
     methods: [

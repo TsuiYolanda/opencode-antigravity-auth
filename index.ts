@@ -1,12 +1,10 @@
-export {
-  AntigravityCLIOAuthPlugin,
-  GoogleOAuthPlugin,
-} from "./src/plugin";
+import v2Plugin from "./src/v2";
 
-export {
-  authorizeAntigravity,
-  exchangeAntigravity,
-} from "./src/antigravity/oauth";
+export default v2Plugin;
+
+export { AntigravityCLIOAuthPlugin, GoogleOAuthPlugin } from "./src/plugin";
+
+export { authorizeAntigravity, exchangeAntigravity } from "./src/antigravity/oauth";
 
 export type {
   AntigravityAuthorization,

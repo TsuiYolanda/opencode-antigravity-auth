@@ -597,6 +597,22 @@ it("removes x-api-key header", () => {
       expect(headers.get("x-api-key")).toBeNull();
     });
 
+    it("removes x-goog-api-key header (opencode V2 provider leaks stored OAuth token there)", () => {
+      const result = prepareAntigravityRequest(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent",
+        {
+          method: "POST",
+          body: JSON.stringify({ contents: [] }),
+          headers: { "x-goog-api-key": "ya29.stale-oauth-access-token" },
+        },
+        mockAccessToken,
+        mockProjectId
+      );
+      const headers = result.init.headers as Headers;
+      expect(headers.get("x-goog-api-key")).toBeNull();
+      expect(headers.get("Authorization")).toBe(`Bearer ${mockAccessToken}`);
+    });
+
     it("removes x-goog-user-project header for antigravity headerStyle", () => {
       const result = prepareAntigravityRequest(
         "https://generativelanguage.googleapis.com/v1beta/models/claude-opus-4-6-thinking:generateContent",
